@@ -68,7 +68,12 @@ offline against a fake HTTP seam — **zero network calls, zero credentials.**
 `config set|get|list`, `bootstrap`, `setup`, `onboard`, `quickstart`, `prime`,
 `hooks`, `upgrade`, `metrics`.
 
-**Maintenance** — **`doctor`** (49 checks, 9 families, `--fix`), `preflight`,
+**Formulas** — **`cook`** (compile a `.formula.toml` into a live issue graph:
+vars, `needs`, `condition`, `loop`, `gate`; `--var`, `--dry-run`), `formula
+list|show|schema`. The compiler is the `bd-formula` crate — pure, TOML in, a plan
+of proto-issues out, tested against the formula files upstream ships.
+
+**Maintenance** — **`doctor`** (48 checks, 9 families, `--fix`), `preflight`,
 `gc`, `purge`, `prune`, `reclaim`, `admin cleanup`, `backup` (exit 2 on SQLite —
 it is a *Dolt* backup: branches, history, working set), `merge-slot`, `worktree`.
 
@@ -76,7 +81,7 @@ it is a *Dolt* backup: branches, history, working set), `merge-slot`, `worktree`
 
 | Command | Blocked on |
 | --- | --- |
-| `mol` (11 leaves), `swarm` (4), `gate` (5), `formula` (4), `cook`, `rules` (2) | **The formula DSL.** These all depend on it. It is a compiler — inheritance, loops, gates, aspect-oriented advice woven over a workflow graph — and it is deliberately **not** being sharded across agents. Splitting a compiler ten ways produces mush, not speed. |
+| `mol` (11 leaves), `swarm` (4), `gate` (5), `rules` (2) | **Molecule / gate / swarm lifecycle.** These sit on the formula compiler (now done — `bd cook` and `bd formula` work) but are their own domain: a molecule is a *persistent* formula instance whose steps are tracked over time. `bd cook` already turns a formula into a live graph; `mol pour` attaches that graph to a tracked container. The next fan-out. |
 | `todo` (3), `human` (4), `remember`/`memories`/`forget`/`recall` | Nothing hard; just unbuilt. |
 | `restore`, `state`, `set-state`, `label propagate` | Custom-status workflow; the seam has the pieces. |
 | `flatten` | |
