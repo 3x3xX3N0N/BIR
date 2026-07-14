@@ -1,0 +1,25 @@
+[package]
+name = "bd-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bd"
+path = "src/main.rs"
+
+[dependencies]
+bd-core = { workspace = true }
+bd-query = { workspace = true }
+bd-sqlite = { workspace = true }
+bd-storage = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

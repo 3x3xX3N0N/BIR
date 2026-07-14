@@ -1,0 +1,248 @@
+//! The storage seam.
+//!
+//! # Design
+//!
+//! A small **core** that every backend must implement, plus **capabilities**
+//! that backends may or may not offer. SQLite is a complete, first-class store
+//! that simply has no commit graph; Dolt is the same store plus branching,
+//! merging, and remotes. Neither is a degraded version of the other.
+//!
+//! Four rules govern this boundary. Upstream's Rust spike learned each of them
+//! the hard way — every one was a real bug — so they are stated as rules, not
+//! suggestions:
+//!
+//! 1. **Construction is on the seam.** [`open`] and [`init`] are seam
+//!    operations. The moment a caller has to name a concrete backend to get a
+//!    store, every entry point in the program starts naming backends.
+//! 2. **Identity is on the seam.** Who is acting is construction-time config
+//!    ([`Identity`]), not a parameter threaded through every write.
+//! 3. **The locator is backend-neutral and self-describing.** A workspace
+//!    records which backend created it; opening *reads* that. `--backend` and
+//!    the environment apply only at `init`. Otherwise a stray env var silently
+//!    reinterprets an existing database as the wrong engine.
+//! 4. **Capabilities optimize core behavior; they never gate it.** For any
+//!    capability used inside a core command there must be a core-only fallback,
+//!    or the whole command is a capability command. A core command that quietly
+//!    does less on SQLite is the bug this rule exists to prevent.
+
+pub mod capability;
+pub mod error;
+pub mod locator;
+pub mod stats;
+
+use async_trait::async_trait;
+use bd_core::{Dependency, Event, Issue, IssueFilter};
+use chrono::{DateTime, Utc};
+
+pub use capability::{Conflict, HistoryViewer, RemoteStore, VersionControl};
+pub use error::{Error, Result};
+pub use locator::{Backend, Locator};
+pub use stats::Stats;
+
+/// Who is performing an operation. Set once, when the store is opened.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Identity {
+    /// Actor id recorded on events and claims — typically an agent name or a
+    /// git email.
+    pub actor: String,
+    /// Session id, used to attribute a close to a specific agent run.
+    pub session: Option<String>,
+}
+
+impl Identity {
+    pub fn new(actor: impl Into<String>) -> Self {
+        Identity {
+            actor: actor.into(),
+            session: None,
+        }
+    }
+}
+
+/// A claim on an issue, held for a bounded time.
+///
+/// Leases expire. An agent that dies mid-task does not hold its work hostage —
+/// the lease lapses and the issue returns to `bd ready`. This is why claiming
+/// is a first-class store operation rather than "set assignee and hope".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub issue_id: String,
+    pub holder: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Fields to change on an issue. `None` means "leave alone", which is what
+/// makes a partial update expressible without a read-modify-write race.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IssuePatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub design: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub notes: Option<String>,
+    pub status: Option<bd_core::Status>,
+    pub priority: Option<bd_core::Priority>,
+    pub issue_type: Option<bd_core::IssueType>,
+    pub assignee: Option<String>,
+    pub estimated_minutes: Option<i32>,
+    pub due_at: Option<DateTime<Utc>>,
+    pub defer_until: Option<DateTime<Utc>>,
+    pub close_reason: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub spec_id: Option<String>,
+    pub external_ref: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+impl IssuePatch {
+    pub fn is_empty(&self) -> bool {
+        *self == IssuePatch::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The core seam
+// ---------------------------------------------------------------------------
+
+/// Everything a beads backend must be able to do.
+///
+/// Object-safe on purpose: the CLI holds a `Box<dyn Storage>` and never learns
+/// which engine it got. That is the whole point of rule 1.
+#[async_trait]
+pub trait Storage: Send + Sync {
+    // --- identity of the store itself ---
+
+    fn backend(&self) -> Backend;
+    fn identity(&self) -> &Identity;
+
+    // --- issues ---
+
+    async fn create_issue(&self, issue: &Issue) -> Result<Issue>;
+    async fn get_issue(&self, id: &str) -> Result<Option<Issue>>;
+    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue>;
+    async fn delete_issue(&self, id: &str) -> Result<()>;
+    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>>;
+    async fn count_issues(&self, filter: &IssueFilter) -> Result<u64>;
+
+    /// Close an issue, recording why. The reason is not decoration: a
+    /// `conditional-blocks` edge reads it to decide whether the *failure* path
+    /// should now become ready.
+    async fn close_issue(&self, id: &str, reason: &str) -> Result<Issue>;
+    async fn reopen_issue(&self, id: &str) -> Result<Issue>;
+
+    /// Mint an id that does not collide with anything currently stored.
+    async fn next_id(&self, prefix: &str, title: &str, description: &str) -> Result<String>;
+
+    // --- claims ---
+
+    /// Take the issue, exclusively, for `lease` long.
+    ///
+    /// Fails with [`Error::AlreadyClaimed`] if someone else holds an unexpired
+    /// lease — *unless* the issue's work type is open-competition.
+    async fn claim_issue(&self, id: &str, lease: chrono::Duration) -> Result<Claim>;
+    async fn renew_claim(&self, id: &str, lease: chrono::Duration) -> Result<Claim>;
+    async fn release_claim(&self, id: &str) -> Result<()>;
+    /// Sweep leases that have lapsed, returning the issues freed.
+    async fn expire_claims(&self) -> Result<Vec<String>>;
+
+    // --- dependencies ---
+
+    async fn add_dependency(&self, dep: &Dependency) -> Result<()>;
+    async fn remove_dependency(&self, issue_id: &str, depends_on_id: &str) -> Result<()>;
+    /// Edges *out of* this issue: what it depends on.
+    async fn dependencies_of(&self, id: &str) -> Result<Vec<Dependency>>;
+    /// Edges *into* this issue: what depends on it.
+    async fn dependents_of(&self, id: &str) -> Result<Vec<Dependency>>;
+    /// Every cycle in the graph. Empty means the graph is a DAG.
+    async fn find_cycles(&self) -> Result<Vec<Vec<String>>>;
+
+    // --- labels ---
+
+    async fn add_label(&self, issue_id: &str, label: &str) -> Result<()>;
+    async fn remove_label(&self, issue_id: &str, label: &str) -> Result<()>;
+    async fn list_labels(&self) -> Result<Vec<String>>;
+
+    // --- comments and audit trail ---
+
+    async fn add_comment(&self, issue_id: &str, text: &str) -> Result<bd_core::Comment>;
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<bd_core::Comment>>;
+    async fn list_events(&self, issue_id: &str) -> Result<Vec<Event>>;
+
+    // --- work queries ---
+    //
+    // These are the reason beads exists. Everything above is bookkeeping in
+    // service of answering "what can I work on right now".
+
+    /// Claimable work: open or in-progress, not blocked by the graph, not
+    /// deferred into the future, not pinned, not an infrastructure bead.
+    async fn ready_work(&self, filter: &IssueFilter) -> Result<Vec<Issue>>;
+    /// The complement: real work that the graph is currently gating.
+    async fn blocked_work(&self, filter: &IssueFilter) -> Result<Vec<Issue>>;
+
+    /// Recompute the denormalized `is_blocked` cache across the whole graph.
+    ///
+    /// Normally maintained incrementally by writes. A full pass is required
+    /// after any operation that changes rows behind the store's back — most
+    /// importantly a merge or a pull, which can land edges and closures that no
+    /// local write path ever saw.
+    async fn recompute_blocked(&self) -> Result<u64>;
+
+    // --- config and workspace metadata ---
+
+    async fn get_config(&self, key: &str) -> Result<Option<String>>;
+    async fn set_config(&self, key: &str, value: &str) -> Result<()>;
+    async fn list_config(&self) -> Result<Vec<(String, String)>>;
+
+    // --- aggregate ---
+
+    async fn stats(&self) -> Result<Stats>;
+
+    // --- lifecycle ---
+
+    async fn close(&self) -> Result<()>;
+
+    // -----------------------------------------------------------------------
+    // Capability accessors
+    //
+    // Default to "absent". A backend opts in by overriding. Callers must handle
+    // `None` — see rule 4: a capability may make a core command *faster* or
+    // *richer*, but a core command must never silently do less without one.
+    // -----------------------------------------------------------------------
+
+    fn version_control(&self) -> Option<&dyn VersionControl> {
+        None
+    }
+    fn remote(&self) -> Option<&dyn RemoteStore> {
+        None
+    }
+    fn history(&self) -> Option<&dyn HistoryViewer> {
+        None
+    }
+
+    /// True when this backend keeps a commit graph. The CLI uses this to decide
+    /// whether commit/sync maintenance is even meaningful, rather than
+    /// type-testing for a concrete backend.
+    fn has_commit_graph(&self) -> bool {
+        self.version_control().is_some()
+    }
+}
+
+/// Open an existing workspace.
+///
+/// The backend is read from the locator, never from the environment (rule 3).
+pub async fn open(locator: &Locator, identity: Identity) -> Result<Box<dyn Storage>> {
+    match locator.backend {
+        Backend::Sqlite => Err(Error::Db(
+            "sqlite backend is provided by the bd-sqlite crate; call bd_sqlite::open".into(),
+        )),
+        Backend::Dolt => Err(Error::unsupported_hint(
+            "open",
+            "dolt",
+            "the dolt backend is not implemented yet",
+        )),
+        Backend::Postgres | Backend::Mysql => Err(Error::unsupported_hint(
+            "open",
+            "sql",
+            "this backend is not implemented yet",
+        )),
+    }
+}
