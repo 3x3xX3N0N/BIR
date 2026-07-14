@@ -124,19 +124,35 @@ fn gc_reaps_expired_wisps_and_touches_nothing_else() {
     assert!(ws.exists(&real), "gc must never touch real work");
 }
 
+/// Two spellings of the same request, and both must exit 0: the caller asked for
+/// no writes and got none, which is a success. A preview that exits 1 is not a
+/// preview.
 #[test]
-fn readonly_is_the_dry_run_gc_does_not_have_a_flag_for() {
+fn dry_run_and_readonly_both_preview_the_sweeps_without_performing_them() {
     let ws = Ws::new("gcdry");
     ws.import(&[wisp("t-ping", "ping", 12)]);
 
-    let (doc, code) = ws.json(&["--json", "--readonly", "gc"]);
-    assert_eq!(code, 0, "a preview is a success, not a refusal");
-    assert_eq!(doc["dry_run"], true);
-    assert_eq!(doc["reaped"], serde_json::json!(["t-ping"]));
-    assert!(
-        ws.exists("t-ping"),
-        "--readonly reported the sweep and then performed it anyway"
-    );
+    for args in [
+        vec!["--json", "--readonly", "gc"],
+        vec!["--json", "gc", "--dry-run"],
+        vec!["--json", "prune", "--dry-run"],
+    ] {
+        let (doc, code) = ws.json(&args);
+        assert_eq!(code, 0, "a preview is a success, not a refusal: {args:?}");
+        assert_eq!(doc["dry_run"], true, "{args:?}");
+        assert_eq!(doc["reaped"], serde_json::json!(["t-ping"]), "{args:?}");
+        assert!(
+            ws.exists("t-ping"),
+            "{args:?} reported the sweep and then performed it anyway"
+        );
+    }
+
+    // And without the flag it really does reap — the previews above are not
+    // passing because the sweep was broken.
+    let (doc, code) = ws.json(&["--json", "gc"]);
+    assert_eq!(code, 0);
+    assert_eq!(doc["dry_run"], false);
+    assert!(!ws.exists("t-ping"));
 }
 
 #[test]
@@ -227,6 +243,50 @@ fn purge_will_not_delete_anything_it_cannot_get_consent_for() {
     assert_eq!(doc["count"], 1);
     assert_eq!(doc["deleted"], serde_json::json!([]));
     assert!(ws.exists(&id));
+
+    // …and so does --dry-run, which is the flag a script reaches for.
+    let (doc, code) = ws.json(&["--json", "purge", "--older-than", "0s", "--dry-run"]);
+    assert_eq!(code, 0);
+    assert_eq!(doc["dry_run"], true);
+    assert_eq!(doc["would_delete"][0], id.as_str());
+    assert!(ws.exists(&id));
+}
+
+/// **A scripted purge has to be able to succeed.**
+///
+/// `bd purge` refuses to read silence on a pipe as consent, and it is right to —
+/// but with no way to *give* consent in writing there was no path on which a
+/// scripted purge succeeded at all. That does not make the command safe, it makes
+/// it useless: a destructive command nobody can run is one people work around,
+/// usually by deleting rows by hand.
+#[test]
+fn yes_is_consent_a_script_can_actually_give() {
+    let ws = Ws::new("purgeyes");
+    let (doomed, _) = ws.run(&["q", "Long since done"]);
+    let (kept, _) = ws.run(&["q", "Still going"]);
+    assert_eq!(ws.run(&["close", &doomed]).1, 0);
+
+    // stdout is a pipe: nobody can answer the prompt. `--yes` is the answer.
+    let (doc, code) = ws.json(&["--json", "purge", "--older-than", "0s", "--yes"]);
+    assert_eq!(code, 0, "a purge with written consent must succeed: {doc}");
+    assert_eq!(doc["dry_run"], false);
+    assert_eq!(doc["deleted"][0], doomed.as_str());
+    assert_eq!(doc["count"], 1);
+
+    assert!(!ws.exists(&doomed), "purge did not delete what it said it did");
+    assert!(kept.is_empty() || ws.exists(&kept), "purge ate open work");
+
+    // --dry-run wins over --yes. Asking to preview and to consent at once is a
+    // contradiction, and the safe reading of a contradiction is the one that
+    // writes nothing.
+    let (other, _) = ws.run(&["q", "Also done"]);
+    assert_eq!(ws.run(&["close", &other]).1, 0);
+    let (doc, code) = ws.json(&[
+        "--json", "purge", "--older-than", "0s", "--yes", "--dry-run",
+    ]);
+    assert_eq!(code, 0);
+    assert_eq!(doc["dry_run"], true);
+    assert!(ws.exists(&other), "--dry-run --yes deleted an issue");
 }
 
 #[test]

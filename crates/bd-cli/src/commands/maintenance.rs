@@ -18,17 +18,25 @@
 //! supposed to be a *true, final* answer that nobody ever revisits. What they are
 //! missing is a seam method; see each one's doc comment for the signature.
 //!
-//! # Why no command here has a --dry-run flag
+//! # Previewing, and consenting
 //!
-//! Because `cli.rs` gives none of them one, and `cli.rs` is frozen. `--readonly`
-//! is the preview switch instead: it is global, it already means "change
-//! nothing", and under it every sweep below reports exactly what it *would* have
-//! done and writes nothing. Note this is the one place `--readonly` reports and
-//! exits 0 rather than refusing: a preview that exits 1 is not a preview.
+//! Two switches, and they are not the same switch.
+//!
+//! **`--dry-run`** (and the global `--readonly`, which implies it) asks a sweep
+//! to report what it *would* do and write nothing. Both exit 0: the caller asked
+//! for no writes and got none, which is a success. A preview that exits 1 is not
+//! a preview.
+//!
+//! **`--yes`** is consent, in writing, for `bd purge` — the one command here that
+//! deletes real work. Purge asks a human when there is one; when stdout is a pipe
+//! there is nobody to answer, and silence is not a yes. Without `--yes` a scripted
+//! purge could not succeed *at all*, which made it a destructive command that
+//! always failed — the worst of both, because the only way to run it was to stop
+//! scripting it.
 
 use std::io::{IsTerminal, Write};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use bd_core::{Issue, IssueFilter, Status};
 use bd_storage::Storage;
 use chrono::{DateTime, Duration, Utc};
@@ -38,7 +46,6 @@ use crate::cli::{AdminCmd, BackupCmd, MergeSlotCmd, WorktreeCmd};
 use crate::commands::{Cap, require_cap, stub};
 use crate::context::Ctx;
 use crate::exit::{self, SilentExit};
-use crate::parse;
 
 /// Wave 4 owns the doctor checks; this stays a stub until the registry lands.
 pub async fn doctor(ctx: &Ctx) -> Result<()> {
@@ -299,26 +306,27 @@ struct Swept {
 /// bead's own type declared. It is structurally incapable of eating your work. A
 /// garbage collector that will not collect garbage unless a human watches is a
 /// garbage collector that never runs.
-pub async fn prune(ctx: &Ctx) -> Result<()> {
-    let swept = sweep(ctx, false).await?;
+pub async fn prune(ctx: &Ctx, dry_run: bool) -> Result<()> {
+    let swept = sweep(ctx, false, dry_run).await?;
     report_sweep(ctx, "prune", &swept)
 }
 
 /// `bd gc`: the wisp sweep *and* the lease sweep — "expired wisps, lapsed
 /// leases", which is exactly what `bd gc --help` promises.
-pub async fn gc(ctx: &Ctx) -> Result<()> {
-    let swept = sweep(ctx, true).await?;
+pub async fn gc(ctx: &Ctx, dry_run: bool) -> Result<()> {
+    let swept = sweep(ctx, true, dry_run).await?;
     report_sweep(ctx, "gc", &swept)
 }
 
-async fn sweep(ctx: &Ctx, leases: bool) -> Result<Swept> {
+async fn sweep(ctx: &Ctx, leases: bool, dry_run: bool) -> Result<Swept> {
     let store = ctx.store().await?;
     let now = Utc::now();
     let r = reapable(store, now).await?;
 
-    // `--readonly` is the dry run. Deliberately not `ensure_writable`, which
-    // *fails*: the caller asked for no writes and got none, which is a success.
-    if ctx.readonly {
+    // `--readonly` implies `--dry-run`; it is the global spelling of the same
+    // request. Deliberately not `ensure_writable`, which *fails*: the caller
+    // asked for no writes and got none, which is a success.
+    if dry_run || ctx.readonly {
         return Ok(Swept {
             reaped: r.expired,
             undated: r.undated,
@@ -387,7 +395,7 @@ fn report_sweep(ctx: &Ctx, cmd: &str, s: &Swept) -> Result<()> {
         }
     }
     if s.preview {
-        ctx.out.line("(--readonly: nothing was written)");
+        ctx.out.line("(dry run: nothing was written)");
     }
     if s.undated > 0 {
         ctx.out.warn(format!(
@@ -476,12 +484,17 @@ fn ask(ctx: &Ctx, question: &str) -> Answer {
 /// The one genuinely dangerous command in this file. What it deletes is real
 /// work, and by construction it is work nobody has looked at in months — so if it
 /// deletes the wrong thing, nobody will notice that either, for months.
-pub async fn purge(ctx: &Ctx, older_than: &str) -> Result<()> {
-    let d = parse::duration(older_than).map_err(|e| anyhow!("--older-than: {e}"))?;
-    purge_closed(ctx, "purge", Some(d)).await
+pub async fn purge(ctx: &Ctx, older_than: Duration, dry_run: bool, yes: bool) -> Result<()> {
+    purge_closed(ctx, "purge", Some(older_than), dry_run, yes).await
 }
 
-async fn purge_closed(ctx: &Ctx, cmd: &str, older_than: Option<Duration>) -> Result<()> {
+async fn purge_closed(
+    ctx: &Ctx,
+    cmd: &str,
+    older_than: Option<Duration>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
     let store = ctx.store().await?;
 
     let filter = IssueFilter {
@@ -516,23 +529,26 @@ async fn purge_closed(ctx: &Ctx, cmd: &str, older_than: Option<Duration>) -> Res
         return Ok(());
     }
 
-    // --readonly: a preview, and an honest exit 0. Nothing was asked for and
-    // nothing was done.
-    if ctx.readonly {
+    // A preview, and an honest exit 0. Nothing was asked for and nothing was done.
+    if dry_run || ctx.readonly {
         return report_purge(ctx, cmd, &doomed, true);
     }
 
-    match ask(
-        ctx,
-        &format!("Permanently delete {} closed issue(s)?", doomed.len()),
-    ) {
-        Answer::Yes => {}
-        // Refusing is exit 1 with the list attached, deliberately loud. There is
-        // no `--yes` flag for a script to pass (cli.rs has none), so a scripted
-        // purge cannot succeed today — and a destructive command that silently
-        // no-ops forever is a worse bug than one that fails in your face.
-        Answer::No => return refuse(ctx, cmd, &doomed, "aborted"),
-        Answer::NoOneToAsk => return refuse(ctx, cmd, &doomed, "no_confirmation"),
+    // `--yes` is consent in writing, and it is the *only* way a script can give
+    // it: `ask` correctly refuses to read silence on a pipe as agreement. Without
+    // it there is no path on which a scripted purge succeeds, which does not make
+    // the command safe — it makes it useless, and a destructive command nobody
+    // can run is one people work around.
+    if !yes {
+        match ask(
+            ctx,
+            &format!("Permanently delete {} closed issue(s)?", doomed.len()),
+        ) {
+            Answer::Yes => {}
+            // Refusing is exit 1 with the list attached, deliberately loud.
+            Answer::No => return refuse(ctx, cmd, &doomed, "aborted"),
+            Answer::NoOneToAsk => return refuse(ctx, cmd, &doomed, "no_confirmation"),
+        }
     }
 
     for id in &doomed {
@@ -557,7 +573,7 @@ fn report_purge(ctx: &Ctx, cmd: &str, ids: &[String], preview: bool) -> Result<(
         ctx.out.line(format!("  {id}"));
     }
     if preview {
-        ctx.out.line("(--readonly: nothing was written)");
+        ctx.out.line("(dry run: nothing was written)");
     }
     Ok(())
 }
@@ -570,7 +586,7 @@ fn refuse(ctx: &Ctx, cmd: &str, ids: &[String], reason: &str) -> Result<()> {
             "command": cmd,
             "count": ids.len(),
             "would_delete": ids,
-            "hint": "run it on a terminal and answer y, or `--readonly` for a preview",
+            "hint": "pass --yes to consent, or --dry-run to preview",
         }))?;
     } else {
         eprintln!("`bd {cmd}` would permanently delete {} closed issue(s):", ids.len());
@@ -578,7 +594,8 @@ fn refuse(ctx: &Ctx, cmd: &str, ids: &[String], reason: &str) -> Result<()> {
             eprintln!("  {id}");
         }
         eprintln!(
-            "Nothing was deleted. Answer y at the prompt to confirm, or run with --readonly to preview."
+            "Nothing was deleted. Answer y at the prompt, pass --yes to consent in writing, \
+             or --dry-run to preview."
         );
     }
     Err(SilentExit(exit::FAILURE).into())
@@ -673,8 +690,10 @@ pub async fn admin(ctx: &Ctx, cmd: AdminCmd) -> Result<()> {
     match cmd {
         // The same engine as `bd purge`, minus the age bound: upstream's
         // `admin cleanup` deletes *every* closed issue by default. Same
-        // confirmation gate, for the same reason, and more of it.
-        AdminCmd::Cleanup => purge_closed(ctx, "admin cleanup", None).await,
+        // confirmation gate, for the same reason, and more of it — and no `--yes`
+        // of its own, because `cli.rs` gives it none. Deleting every closed issue
+        // in the workspace is not something to make scriptable by accident.
+        AdminCmd::Cleanup => purge_closed(ctx, "admin cleanup", None, false, false).await,
         // The same missing seam method as `bd compact`; see there.
         AdminCmd::Compact => stub("admin compact", ctx),
         // Throwing the database away. This needs no seam method — it is a

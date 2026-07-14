@@ -31,6 +31,24 @@ pub fn dep_spec(s: &str) -> Result<DepSpec, String> {
     })
 }
 
+/// An edge type for `bd link`, which is *only* for edges that do not gate work.
+///
+/// The restriction is enforced in `issues.rs` too, and belongs in both places for
+/// different reasons: there it is a domain rule, here it is a usage error. A
+/// `--type` that clap accepts and the handler then refuses is a flag that exists
+/// in `--help`, tab-completes, and cannot be used — which reads as a bug in beads
+/// rather than as a mistake by the caller.
+pub fn link_type(s: &str) -> Result<DependencyType, String> {
+    let t = s.parse::<DependencyType>().map_err(|e| e.to_string())?;
+    if t.affects_ready_work() {
+        return Err(format!(
+            "`{t}` gates readiness; `bd link` is for non-blocking edges. \
+             Use `bd dep add` for edges that block work."
+        ));
+    }
+    Ok(t)
+}
+
 /// `90s`, `30m`, `2h`, `3d`, `1w`. A bare number is minutes.
 pub fn duration(s: &str) -> Result<Duration, String> {
     let t = s.trim();
@@ -104,6 +122,23 @@ mod tests {
         assert_eq!(duration("1w").unwrap(), Duration::weeks(1));
         assert!(duration("tomorrow").is_err());
         assert!(duration("-1h").is_err());
+    }
+
+    #[test]
+    fn link_refuses_the_edge_types_that_gate_work() {
+        // `bd link --type blocks` would make marking a relationship silently
+        // block the issue it marks, which is the one thing `bd link` promises
+        // never to do. Every one of the four gating types is refused.
+        for t in ["blocks", "parent-child", "conditional-blocks", "waits-for"] {
+            assert!(link_type(t).is_err(), "{t} must not be linkable");
+        }
+        assert_eq!(link_type("related").unwrap(), DependencyType::Related);
+        assert_eq!(link_type("duplicates").unwrap(), DependencyType::Duplicates);
+        // A custom edge type is somebody else's vocabulary, and it gates nothing.
+        assert_eq!(
+            link_type("mentions").unwrap(),
+            DependencyType::Custom("mentions".into())
+        );
     }
 
     #[test]

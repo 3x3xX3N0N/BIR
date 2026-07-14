@@ -228,24 +228,6 @@ async fn index_all(store: &dyn Storage) -> Result<HashMap<String, Issue>> {
     Ok(all.into_iter().map(|i| (i.id.clone(), i)).collect())
 }
 
-/// Every edge in the graph.
-///
-/// The seam exposes edges one issue at a time, so this is one query per issue.
-/// Out-edges only, deliberately: every edge is *some* issue's out-edge, so
-/// walking all issues' out-edges enumerates the graph exactly once — asking for
-/// dependents too would double the query count and return each edge twice.
-///
-/// This is why `lint` and `orphans` are batch commands and not something you run
-/// in a loop. A `list_dependencies(&IssueFilter)` on the seam would collapse the
-/// whole thing to one query.
-async fn all_edges(store: &dyn Storage, ids: &[String]) -> Result<Vec<Dependency>> {
-    let mut edges = Vec::new();
-    for id in ids {
-        edges.extend(store.dependencies_of(id).await?);
-    }
-    Ok(edges)
-}
-
 /// Attach labels to issues that came from `list_issues`, which does not hydrate
 /// relations. One batched query for the whole set — `get_issue` per issue would
 /// be an N+1 and is exactly what [`Storage::labels_of`] exists to prevent.
@@ -298,15 +280,10 @@ pub async fn children(ctx: &Ctx, id: &str) -> Result<()> {
         bail!("issue not found: {id}");
     }
 
-    // A `get_issue` loop, and on purpose: the id set is the children of one
-    // issue — small and already in hand — so a full-table scan to index it would
-    // cost more than the loop it saved.
-    let mut kids = Vec::new();
-    for child in child_ids(store, id).await? {
-        if let Some(i) = store.get_issue(&child).await? {
-            kids.push(i);
-        }
-    }
+    // Two queries, whatever the fan-out: the edges, then the beads they name.
+    // A child edge pointing at an issue that does not exist simply yields no row
+    // — `bd lint` is where that gets reported, not here.
+    let mut kids = store.get_issues(&child_ids(store, id).await?).await?;
     kids.sort_by(by_priority_then_id);
     ctx.out.issues(&kids)
 }
@@ -334,14 +311,12 @@ async fn epic_rollup(store: &dyn Storage) -> Result<Vec<(Issue, Vec<Issue>)>> {
     }
     epics.sort_by(by_priority_then_id);
 
-    let index = index_all(store).await?;
     let mut out = Vec::new();
     for e in epics {
-        let mut kids: Vec<Issue> = child_ids(store, &e.id)
-            .await?
-            .iter()
-            .filter_map(|c| index.get(c).cloned())
-            .collect();
+        // `get_issues` drops ids it cannot find, which is the behaviour this
+        // wants: a phantom child would otherwise be counted as open work and
+        // hold an epic at 90% forever.
+        let mut kids = store.get_issues(&child_ids(store, &e.id).await?).await?;
         kids.sort_by(by_priority_then_id);
         out.push((e, kids));
     }
@@ -438,26 +413,27 @@ async fn epic_close_eligible(ctx: &Ctx) -> Result<()> {
 // Hygiene: stale, orphans, duplicates, lint
 // ---------------------------------------------------------------------------
 
-pub async fn stale(ctx: &Ctx, older_than: &str) -> Result<()> {
+pub async fn stale(ctx: &Ctx, older_than: Duration) -> Result<()> {
     let store = ctx.store().await?;
-    let d = crate::parse::duration(older_than).map_err(|e| anyhow!("--older-than: {e}"))?;
-    let cutoff = Utc::now() - d;
+    let cutoff = Utc::now() - older_than;
 
     let mut f = IssueFilter::new();
     // Closed issues are *supposed* to sit untouched. Only live work goes stale.
     f.statuses = OPEN_STATUSES.to_vec();
     f.updated_before = Some(cutoff);
-    let mut issues = store.list_issues(&f).await?;
+    // Least-recently-touched first, and ordered *in SQL*.
+    //
+    // Not `SortPolicy::Oldest`, which orders by `created_at` — an issue filed
+    // last year and touched this morning is not stale. And not a sort in memory:
+    // this command takes no `--limit` today, but the day it does, a limit applied
+    // by the database under one order and re-sorted here under another silently
+    // returns the wrong page, and nothing about the output says so.
+    f.sort = SortPolicy::Updated;
 
-    // `SortPolicy::Oldest` orders by *created_at*, which is not what staleness
-    // means — an issue filed last year and touched this morning is not stale.
-    // Sorting here is safe only because this command applies no LIMIT: a limit
-    // pushed down under one order and re-sorted under another returns the wrong
-    // page.
-    issues.sort_by_key(|i| i.updated_at);
+    let issues = store.list_issues(&f).await?;
 
     ctx.out.line(format!(
-        "Untouched since {} ({older_than}):",
+        "Untouched since {}:",
         cutoff.format("%Y-%m-%d %H:%M")
     ));
     ctx.out.issues(&issues)
@@ -466,12 +442,10 @@ pub async fn stale(ctx: &Ctx, older_than: &str) -> Result<()> {
 pub async fn orphans(ctx: &Ctx) -> Result<()> {
     let store = ctx.store().await?;
     let index = index_all(store).await?;
-    let mut ids: Vec<String> = index.keys().cloned().collect();
-    ids.sort();
 
-    // Every issue, including closed ones: an edge from a closed issue still
-    // connects the issue on the other end of it.
-    let edges = all_edges(store, &ids).await?;
+    // Every edge, including those out of closed issues: an edge from a closed
+    // issue still connects the issue on the other end of it.
+    let edges = store.list_dependencies(&IssueFilter::new()).await?;
     let mut connected: HashSet<&str> = HashSet::new();
     for e in &edges {
         connected.insert(e.issue_id.as_str());
@@ -620,12 +594,7 @@ pub async fn find_duplicates(ctx: &Ctx, id: &str) -> Result<()> {
     linked_ids.sort();
     linked_ids.dedup();
 
-    let mut linked = Vec::new();
-    for l in &linked_ids {
-        if let Some(i) = store.get_issue(l).await? {
-            linked.push(i);
-        }
-    }
+    let linked = store.get_issues(&linked_ids).await?;
 
     let known: HashSet<&String> = linked_ids.iter().collect();
     let target_hash = content_key(&target);
@@ -704,7 +673,7 @@ pub async fn lint(ctx: &Ctx) -> Result<()> {
     let index = index_all(store).await?;
     let mut ids: Vec<String> = index.keys().cloned().collect();
     ids.sort(); // HashMap order is not an order; the report must be stable.
-    let edges = all_edges(store, &ids).await?;
+    let edges = store.list_dependencies(&IssueFilter::new()).await?;
 
     let mut out_edges: HashMap<&str, Vec<&Dependency>> = HashMap::new();
     let mut child_count: HashMap<&str, usize> = HashMap::new();
@@ -725,21 +694,33 @@ pub async fn lint(ctx: &Ctx) -> Result<()> {
         }));
     }
 
-    // An edge to an id that is not there. The source is always present (these
-    // edges came from walking the issue table), so only the target can dangle.
+    // An edge naming an id that is not there — at *either* end. `list_dependencies`
+    // reads the edge table itself, so an edge whose source has vanished is
+    // visible here now; it used to be undetectable, because the only way to find
+    // an edge was to walk out of an issue that existed.
     for e in &edges {
-        if !index.contains_key(&e.depends_on_id) {
-            problems.push(json!({
-                "kind": "dangling_edge",
-                "id": e.issue_id,
-                "depends_on_id": e.depends_on_id,
-                "type": e.dep_type.as_str(),
-                "detail": format!(
-                    "{} has a {} edge to {}, which does not exist",
-                    e.issue_id, e.dep_type, e.depends_on_id
-                ),
-            }));
+        let missing: Vec<&str> = [&e.issue_id, &e.depends_on_id]
+            .into_iter()
+            .filter(|id| !index.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            continue;
         }
+        problems.push(json!({
+            "kind": "dangling_edge",
+            "id": e.issue_id,
+            "depends_on_id": e.depends_on_id,
+            "type": e.dep_type.as_str(),
+            "missing": missing,
+            "detail": format!(
+                "the {} edge {} -> {} names {}, which does not exist",
+                e.dep_type,
+                e.issue_id,
+                e.depends_on_id,
+                missing.join(" and ")
+            ),
+        }));
     }
 
     // A `conditional-blocks` edge means "run me only if the target *fails*". If
@@ -919,16 +900,15 @@ pub async fn context(ctx: &Ctx) -> Result<()> {
     wf.limit = Some(N as u32);
     let mut in_progress = store.list_issues(&wf).await?;
 
-    // No LIMIT here, and no sort policy orders by `closed_at` — so the window
-    // does the bounding and the ordering happens in memory. Pushing a LIMIT down
-    // under the default sort would hand back the *oldest-created* closes in the
-    // window and call them recent.
+    // Most-recently-closed first, ordered and limited *by the database*. Under
+    // any other sort policy a pushed-down LIMIT would hand back the
+    // oldest-*created* closes in the window and call them recent.
     let mut cf = IssueFilter::new();
     cf.statuses = vec![Status::Closed];
     cf.closed_after = Some(Utc::now() - Duration::days(RECENT));
+    cf.sort = SortPolicy::Closed;
+    cf.limit = Some(N as u32);
     let mut closed = store.list_issues(&cf).await?;
-    closed.sort_by_key(|i| std::cmp::Reverse(i.closed_at));
-    closed.truncate(N);
 
     // Labels are worth the one extra query here: they are how an agent decides
     // whether a bead is its department.

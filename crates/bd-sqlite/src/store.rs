@@ -1,7 +1,9 @@
 //! The SQLite [`Storage`] implementation.
 
 use async_trait::async_trait;
-use bd_core::{Comment, Dependency, Event, EventType, Issue, IssueFilter, Status, idgen};
+use bd_core::{
+    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueFilter, Status, idgen,
+};
 use bd_storage::{Backend, Claim, Error, Field, Identity, IssuePatch, Result, Stats, Storage};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
@@ -98,6 +100,33 @@ impl Storage for SqliteStore {
         issue.dependencies = fetch_dependencies_of(&mut conn, id).await?;
         issue.comments = fetch_comments(&mut conn, id).await?;
         Ok(Some(issue))
+    }
+
+    /// Relations are left empty, as in `list_issues`: this is the batched form
+    /// of a listing, not of `get_issue`.
+    async fn get_issues(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+            "SELECT {ISSUE_COLUMNS} FROM issues WHERE id IN ("
+        ));
+        let mut sep = qb.separated(", ");
+        for id in ids {
+            sep.push_bind(id.clone());
+        }
+        qb.push(")");
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+        let mut by_id: HashMap<String, Issue> = rows
+            .iter()
+            .map(|r| issue_from_row(r).map(|i| (i.id.clone(), i)))
+            .collect::<Result<_>>()?;
+
+        // The caller's order, so a listing can zip this against the ids it asked
+        // about. A missing id is a gap, not an error — see the seam's doc.
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
     async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue> {
@@ -213,9 +242,31 @@ impl Storage for SqliteStore {
             if let Some(v) = patch.pinned {
                 qb.push(", pinned = ").push_bind(v);
             }
+            // `bd promote` moves these two together. They are separate fields
+            // because only one of them is a flag: an ephemeral bead with no
+            // wisp type has no TTL at all, so `bd gc` leaves it alone forever.
+            if let Some(v) = patch.ephemeral {
+                qb.push(", ephemeral = ").push_bind(v);
+            }
+            match &patch.wisp_type {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", wisp_type = ").push_bind(enum_to_str(v));
+                }
+                Field::Clear => {
+                    qb.push(", wisp_type = NULL");
+                }
+            }
 
             qb.push(" WHERE id = ").push_bind(id.to_string());
             qb.build().execute(&mut *tx).await.map_err(db)?;
+
+            // Almost every column above is hashed content. Recomputing here
+            // rather than field-by-field is not laziness: the hash exists for
+            // cross-clone identity and import dedup, so a hash that describes
+            // the issue's *previous* text does not merely go stale — it makes
+            // two different beads look like the same one.
+            refresh_content_hash(&mut tx, id).await?;
         }
 
         if let Some(new_status) = &patch.status
@@ -336,6 +387,8 @@ impl Storage for SqliteStore {
         self.event(&mut tx, id, EventType::Closed, None, Some(reason), now)
             .await?;
 
+        // `status` and `close_reason` are both hashed.
+        refresh_content_hash(&mut tx, id).await?;
         blocked::recompute_affected(&mut tx, &[id.to_string()]).await?;
         tx.commit().await.map_err(db)?;
 
@@ -369,6 +422,7 @@ impl Storage for SqliteStore {
                 .await?;
         }
 
+        refresh_content_hash(&mut tx, id).await?;
         blocked::recompute_affected(&mut tx, &[id.to_string()]).await?;
         tx.commit().await.map_err(db)?;
 
@@ -474,6 +528,8 @@ impl Storage for SqliteStore {
             now,
         )
         .await?;
+        // A claim moves `assignee` and `status`, and both are hashed.
+        refresh_content_hash(&mut tx, id).await?;
         blocked::recompute_affected(&mut tx, &[id.to_string()]).await?;
         tx.commit().await.map_err(db)?;
 
@@ -484,6 +540,13 @@ impl Storage for SqliteStore {
         })
     }
 
+    /// Renewing is not claiming: it extends a lease this actor already holds and
+    /// never takes one it does not.
+    ///
+    /// The three ways it can fail are three *different* facts, and reporting them
+    /// as one is how `bd heartbeat` on an unclaimed bead came to say "already
+    /// claimed by ''" — a message that describes a race with a nameless agent
+    /// when what actually happened is that you never claimed the issue.
     async fn renew_claim(&self, id: &str, lease: Duration) -> Result<Claim> {
         let mut conn = self.pool.acquire().await.map_err(db)?;
         let now = Utc::now();
@@ -506,9 +569,19 @@ impl Storage for SqliteStore {
             let existing = fetch_issue(&mut conn, id)
                 .await?
                 .ok_or_else(|| Error::NotFound(id.to_string()))?;
-            return Err(Error::AlreadyClaimed {
-                id: id.to_string(),
-                holder: existing.assignee,
+            return Err(if existing.assignee.is_empty() {
+                Error::NotClaimed(id.to_string())
+            } else if existing.assignee != self.identity.actor {
+                Error::AlreadyClaimed {
+                    id: id.to_string(),
+                    holder: existing.assignee,
+                }
+            } else {
+                // Ours, and the UPDATE still matched nothing: the only remaining
+                // predicate is the status, so the issue is closed.
+                Error::Db(format!(
+                    "issue {id} is closed; reopen it before renewing the claim"
+                ))
             });
         }
 
@@ -555,6 +628,7 @@ impl Storage for SqliteStore {
             self.status_events(&mut tx, id, &Status::InProgress, &Status::Open, now)
                 .await?;
         }
+        refresh_content_hash(&mut tx, id).await?;
         blocked::recompute_affected(&mut tx, &[id.to_string()]).await?;
         tx.commit().await.map_err(db)
     }
@@ -593,6 +667,7 @@ impl Storage for SqliteStore {
 
             self.status_events(&mut tx, id, &Status::InProgress, &Status::Open, now)
                 .await?;
+            refresh_content_hash(&mut tx, id).await?;
         }
 
         blocked::recompute_affected(&mut tx, &freed).await?;
@@ -661,9 +736,18 @@ impl Storage for SqliteStore {
         tx.commit().await.map_err(db)
     }
 
-    /// Removes every edge between the two beads, whatever its type — the seam
-    /// gives no type to disambiguate with.
-    async fn remove_dependency(&self, issue_id: &str, depends_on_id: &str) -> Result<()> {
+    /// Removes exactly the one edge named by the triple.
+    ///
+    /// The type is part of the primary key precisely because a pair of beads can
+    /// hold several edges at once, so a DELETE without it removes all of them —
+    /// `bd dep remove A B` silently destroying an unrelated `related` edge while
+    /// reporting success.
+    async fn remove_dependency(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let now = Utc::now();
 
@@ -674,23 +758,29 @@ impl Storage for SqliteStore {
             blocked::affected_set(&mut tx, &[issue_id.to_string(), depends_on_id.to_string()])
                 .await?;
 
-        let removed = sqlx::query("DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?")
-            .bind(issue_id)
-            .bind(depends_on_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?
-            .rows_affected();
+        let removed = sqlx::query(
+            "DELETE FROM dependencies
+             WHERE issue_id = ? AND depends_on_id = ? AND type = ?",
+        )
+        .bind(issue_id)
+        .bind(depends_on_id)
+        .bind(dep_type.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
 
         if removed == 0 {
-            return Err(Error::NotFound(format!("{issue_id} -> {depends_on_id}")));
+            return Err(Error::NotFound(format!(
+                "{issue_id} -> {depends_on_id} [{dep_type}]"
+            )));
         }
 
         self.event(
             &mut tx,
             issue_id,
             EventType::DependencyRemoved,
-            Some(depends_on_id),
+            Some(&format!("{depends_on_id} ({dep_type})")),
             None,
             now,
         )
@@ -715,6 +805,55 @@ impl Storage for SqliteStore {
         .await
         .map_err(db)?;
         rows.iter().map(dependency_from_row).collect()
+    }
+
+    async fn list_dependencies(&self, filter: &IssueFilter) -> Result<Vec<Dependency>> {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+             FROM dependencies",
+        );
+
+        // An empty filter means every edge *in the table* — deliberately not
+        // "every edge whose source is an issue that exists". The two differ only
+        // on a corrupt graph, and a corrupt graph is the entire reason
+        // `bd lint` and `bd graph check` ask this question.
+        if !filter.is_empty() {
+            qb.push(" WHERE issue_id IN (SELECT id FROM issues WHERE 1 = 1");
+            push_filter(&mut qb, filter);
+            qb.push(")");
+        }
+        qb.push(" ORDER BY issue_id, depends_on_id, type");
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+        rows.iter().map(dependency_from_row).collect()
+    }
+
+    async fn dependencies_of_many(&self, ids: &[String]) -> Result<Vec<(String, Vec<Dependency>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+             FROM dependencies WHERE issue_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in ids {
+            sep.push_bind(id.clone());
+        }
+        qb.push(") ORDER BY issue_id, depends_on_id, type");
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+
+        let mut grouped: HashMap<String, Vec<Dependency>> = HashMap::new();
+        for row in rows.iter() {
+            let dep = dependency_from_row(row)?;
+            grouped.entry(dep.issue_id.clone()).or_default().push(dep);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| grouped.remove(id).map(|deps| (id.clone(), deps)))
+            .collect())
     }
 
     async fn find_cycles(&self) -> Result<Vec<Vec<String>>> {
@@ -744,6 +883,9 @@ impl Storage for SqliteStore {
             Utc::now(),
         )
         .await?;
+        // Labels are inside the content hash — `Issue::compute_content_hash`
+        // sorts and folds them in — so a label write moves the hash.
+        refresh_content_hash(&mut tx, issue_id).await?;
         tx.commit().await.map_err(db)
     }
 
@@ -768,6 +910,7 @@ impl Storage for SqliteStore {
             Utc::now(),
         )
         .await?;
+        refresh_content_hash(&mut tx, issue_id).await?;
         tx.commit().await.map_err(db)
     }
 
@@ -821,23 +964,18 @@ impl Storage for SqliteStore {
     /// This is the idempotent half of the pair. `add_comment` mints a new id and
     /// stamps the caller as author; re-running an import through it would
     /// duplicate every comment and reattribute all of them to the importer.
+    ///
+    /// The incoming id is the identity, and it is honored *whatever it says* —
+    /// including an integer id from an older export, which is why nothing here
+    /// parses or validates its shape. Ids minted from now on are UUIDs (see
+    /// `schema.sql`), so a collision between two workspaces is not a thing that
+    /// happens rather than a thing that is caught.
     async fn upsert_comment(&self, comment: &Comment) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(db)?;
 
         if fetch_issue(&mut tx, &comment.issue_id).await?.is_none() {
             return Err(Error::NotFound(comment.issue_id.clone()));
         }
-
-        // The incoming id is the identity. Comment ids are integers here, so a
-        // non-numeric id from a foreign exporter cannot be honored -- and
-        // silently minting a new one would defeat the idempotency this method
-        // exists to provide, so it is an error rather than a surprise.
-        let id: i64 = comment.id.parse().map_err(|_| {
-            Error::Db(format!(
-                "comment id {:?} is not an integer; cannot upsert it without inventing a new id",
-                comment.id
-            ))
-        })?;
 
         sqlx::query(
             "INSERT INTO comments (id, issue_id, author, text, created_at)
@@ -848,7 +986,7 @@ impl Storage for SqliteStore {
                  text       = excluded.text,
                  created_at = excluded.created_at",
         )
-        .bind(id)
+        .bind(&comment.id)
         .bind(&comment.issue_id)
         .bind(&comment.author)
         .bind(&comment.text)
@@ -869,15 +1007,22 @@ impl Storage for SqliteStore {
             return Err(Error::NotFound(issue_id.to_string()));
         }
 
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO comments (issue_id, author, text, created_at)
-             VALUES (?, ?, ?, ?) RETURNING id",
+        // Globally unique, not workspace-local. `upsert_comment` treats the id
+        // as the comment's identity, so an id that only means something inside
+        // one database turns `bd import` into a way to overwrite the importer's
+        // own comments.
+        let id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO comments (id, issue_id, author, text, created_at)
+             VALUES (?, ?, ?, ?, ?)",
         )
+        .bind(&id)
         .bind(issue_id)
         .bind(&self.identity.actor)
         .bind(text)
         .bind(now)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
 
@@ -886,7 +1031,7 @@ impl Storage for SqliteStore {
         tx.commit().await.map_err(db)?;
 
         Ok(Comment {
-            id: id.to_string(),
+            id,
             issue_id: issue_id.to_string(),
             author: self.identity.actor.clone(),
             text: text.to_string(),
@@ -897,6 +1042,35 @@ impl Storage for SqliteStore {
     async fn list_comments(&self, issue_id: &str) -> Result<Vec<Comment>> {
         let mut conn = self.pool.acquire().await.map_err(db)?;
         fetch_comments(&mut conn, issue_id).await
+    }
+
+    async fn comments_of_many(&self, ids: &[String]) -> Result<Vec<(String, Vec<Comment>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in ids {
+            sep.push_bind(id.clone());
+        }
+        // By time, never by id: comment ids are UUIDs and sort meaninglessly, so
+        // ordering on them would shuffle a conversation.
+        qb.push(") ORDER BY issue_id, created_at, id");
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+
+        let mut grouped: HashMap<String, Vec<Comment>> = HashMap::new();
+        for row in rows.iter() {
+            let c = comment_from_row(row)?;
+            grouped.entry(c.issue_id.clone()).or_default().push(c);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| grouped.remove(id).map(|cs| (id.clone(), cs)))
+            .collect())
     }
 
     async fn list_events(&self, issue_id: &str) -> Result<Vec<Event>> {
@@ -1225,16 +1399,47 @@ async fn fetch_dependencies_of(conn: &mut SqliteConnection, id: &str) -> Result<
     rows.iter().map(dependency_from_row).collect()
 }
 
+/// A comment thread is ordered by *time*. Ordering by id worked only while ids
+/// were a monotonic integer; a UUID sorts at random, and a shuffled thread reads
+/// as a different conversation.
 async fn fetch_comments(conn: &mut SqliteConnection, id: &str) -> Result<Vec<Comment>> {
     let rows = sqlx::query(
         "SELECT id, issue_id, author, text, created_at FROM comments
-         WHERE issue_id = ? ORDER BY id",
+         WHERE issue_id = ? ORDER BY created_at, id",
     )
     .bind(id)
     .fetch_all(&mut *conn)
     .await
     .map_err(db)?;
     rows.iter().map(comment_from_row).collect()
+}
+
+/// Rewrite `content_hash` from what the issue now says.
+///
+/// Called from inside every transaction that touches hashed content — which is
+/// most of them, because the hash covers the title, the body, the status, the
+/// assignee, the close reason *and* the labels. It is deliberately a re-read
+/// rather than an incremental adjustment: `Issue::compute_content_hash` in
+/// bd-core is the single definition of what the hash is over, and a second copy
+/// of that field list here would be the copy that goes stale.
+///
+/// Note it writes `content_hash` and nothing else — in particular not
+/// `updated_at`, which is a record of somebody editing the issue and must not be
+/// bumped by derived state.
+async fn refresh_content_hash(conn: &mut SqliteConnection, id: &str) -> Result<()> {
+    let Some(mut issue) = fetch_issue(conn, id).await? else {
+        // Deleted inside this same transaction. Nothing to hash.
+        return Ok(());
+    };
+    issue.labels = fetch_labels(conn, id).await?;
+
+    sqlx::query("UPDATE issues SET content_hash = ? WHERE id = ?")
+        .bind(issue.compute_content_hash())
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+    Ok(())
 }
 
 async fn count(pool: &SqlitePool, sql: &str, binds: &[&str]) -> Result<u64> {

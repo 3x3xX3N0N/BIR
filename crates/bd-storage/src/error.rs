@@ -32,6 +32,13 @@ pub enum Error {
     #[error("issue {id} is already claimed by {holder}")]
     AlreadyClaimed { id: String, holder: String },
 
+    /// Nobody holds it. Distinct from [`Error::AlreadyClaimed`] on purpose:
+    /// renewing a claim that does not exist used to report "already claimed by
+    /// ''", which reads as a race with a nameless agent rather than as "you
+    /// never claimed this".
+    #[error("issue {0} is not claimed; claim it first (`bd update {0} --claim`)")]
+    NotClaimed(String),
+
     /// Optimistic concurrency check failed; the row moved under us.
     #[error("issue {0} was modified concurrently; retry")]
     Conflict(String),

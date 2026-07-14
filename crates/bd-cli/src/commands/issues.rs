@@ -1127,6 +1127,9 @@ enum BatchOp {
     Undep {
         from: String,
         to: String,
+        /// Which edge. Defaults to `blocks`, mirroring `dep`.
+        #[serde(default, rename = "type")]
+        dep_type: Option<DependencyType>,
     },
 }
 
@@ -1344,8 +1347,20 @@ async fn apply_batch_op(
             dep.created_by = ctx.identity.actor.clone();
             store.add_dependency(&dep).await?;
         }
-        BatchOp::Undep { from, to } => {
-            store.remove_dependency(from, to).await?;
+        BatchOp::Undep {
+            from,
+            to,
+            dep_type,
+        } => {
+            // The type is not decoration. Two beads may hold several edges at
+            // once, and a removal that ignored the type would take all of them.
+            store
+                .remove_dependency(
+                    from,
+                    to,
+                    dep_type.as_ref().unwrap_or(&DependencyType::Blocks),
+                )
+                .await?;
         }
     }
     Ok(())
@@ -1358,7 +1373,7 @@ async fn apply_batch_op(
 // The arguments are already threaded through from the command tree, so filling
 // one of these in is writing a body — not touching the dispatch.
 //
-// These four are not *unwritten*; they are **unwritable on this seam**, and the
+// These three are not *unwritten*; they are **unwritable on this seam**, and the
 // difference matters to whoever picks them up. Each needs storage that does not
 // exist yet, and every way of faking it lies:
 //
@@ -1372,15 +1387,6 @@ async fn apply_batch_op(
 //     `async fn list_deleted(&self) -> Result<Vec<Issue>>`
 //   plus a `deleted_at` column and its exclusion from every default filter.
 //
-// * `promote` — a wisp is a bead with `ephemeral = true` (and a `wisp_type`).
-//   Promoting it means clearing those. `IssuePatch` has neither field, so the
-//   patch type cannot say it, and `create`+`delete` would mint a new id and lose
-//   the edges pointing at the old one.
-//   Needs, on `IssuePatch`:
-//     `pub ephemeral: Option<bool>`
-//     `pub wisp_type: Field<bd_core::WispType>`
-//     (`no_history` and `mol_type` are unreachable for the same reason.)
-//
 // * `state` / `set-state` — a workflow state is not a status. It is a position
 //   in a state machine the workspace defines, with legal transitions; that
 //   machine is the formula DSL (wave 5) and nothing stores it. `set-state` over
@@ -1392,6 +1398,10 @@ async fn apply_batch_op(
 //     `async fn transition(&self, id: &str, to: &str) -> Result<Issue>`  // rejects an illegal move
 //   (`statuses` has the smaller half of the same gap: there is no
 //   `list_statuses`, so it reports the built-ins and says so.)
+//
+// (`promote` used to be on this list. It needed `ephemeral` and `wisp_type` on
+// `IssuePatch`; they exist now, and it is written below. `no_history` and
+// `mol_type` remain unreachable for the reason `promote` was.)
 
 pub async fn restore(ctx: &Ctx, _id: &str) -> Result<()> {
     stub("restore", ctx)
@@ -1405,8 +1415,37 @@ pub async fn set_state(ctx: &Ctx, _id: &str, _state: &str) -> Result<()> {
     stub("set-state", ctx)
 }
 
-pub async fn promote(ctx: &Ctx, _id: &str) -> Result<()> {
-    stub("promote", ctx)
+/// `bd promote`: a wisp becomes a real bead.
+///
+/// A wisp is an ordinary row with `ephemeral = 1` and a `wisp_type` that declares
+/// its TTL. Promotion clears both, and it has to clear *both*: an ephemeral bead
+/// is invisible to `bd ready`, and a bead that still names a wisp type still
+/// carries that type's TTL — so a half-promotion yields either work nobody can
+/// find or work `bd gc` deletes out from under whoever claimed it.
+///
+/// It is an update rather than a create-and-delete for the reason renames are:
+/// the id is a foreign key, and minting a new one would cascade away every edge,
+/// comment and label pointing at the old one.
+pub async fn promote(ctx: &Ctx, id: &str) -> Result<()> {
+    ctx.ensure_writable("promote an issue")?;
+    let store = ctx.store().await?;
+    let issue = require_issue(store, id).await?;
+
+    // Not an error worth a special case, but not a silent success either: a
+    // caller that promotes the wrong id should hear about it.
+    if !issue.ephemeral && issue.wisp_type.is_none() {
+        bail!("{id} is already a real bead; there is nothing to promote");
+    }
+
+    let promoted = store.update_issue(id, &IssuePatch::promote()).await?;
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&issue_json(&promoted, &[], &[], &[]))?;
+    } else {
+        ctx.out
+            .line(format!("Promoted {id}; it is a real bead now, and claimable"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

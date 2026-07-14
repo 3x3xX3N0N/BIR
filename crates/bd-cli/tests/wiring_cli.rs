@@ -171,6 +171,40 @@ fn setup_refuses_a_file_with_unbalanced_markers_and_leaves_it_alone() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `bd setup claude` — a named recipe, which the command tree could not carry
+/// until `Setup` stopped being a unit variant. The handler had been written and
+/// was simply unreachable.
+#[test]
+fn setup_writes_the_harness_it_was_told_to_write() {
+    let dir = tempdir("recipe");
+
+    // No CLAUDE.md, no .claude/ — detection would have picked AGENTS.md. Being
+    // told beats guessing.
+    let doc = json(&dir, &["--json", "setup", "claude"]);
+    assert_eq!(doc["files"][0]["recipe"], "claude");
+    assert_eq!(doc["files"][0]["action"], "created");
+    assert!(dir.join("CLAUDE.md").exists());
+    assert!(
+        !dir.join("AGENTS.md").exists(),
+        "a named recipe must not also write the file detection would have chosen"
+    );
+
+    // Two harnesses at once, and the codex/factory pair that share one file must
+    // still write it once.
+    let doc = json(&dir, &["--json", "setup", "claude", "codex", "factory"]);
+    let files = doc["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "codex and factory are both AGENTS.md: {doc}");
+    let agents = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert_eq!(agents.matches(BEGIN).count(), 1);
+
+    // An unknown harness is an error, not a silent no-op.
+    let r = run(&dir, &["setup", "emacs"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("emacs"), "{}", r.stderr);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn setup_writes_agents_md_when_the_repo_names_no_harness() {
     let dir = tempdir("agents");

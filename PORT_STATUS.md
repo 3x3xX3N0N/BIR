@@ -91,7 +91,7 @@ above.
 | `heartbeat` (alias `hb`) | stub | `store.renew_claim` is right there; the open question is what it does to `heartbeat_at`. |
 | `state` / `set-state` | stub | Custom-status workflow. |
 | `statuses` / `types` | stub | |
-| `promote` | stub | |
+| `promote` | done | Wisp → real bead. Clears `ephemeral` *and* `wisp_type` together: a bead that kept its wisp type keeps that type's TTL, and `bd gc` would reap the bead somebody just promoted. |
 | `batch` | stub | |
 
 ## Views
@@ -127,11 +127,11 @@ above.
 | Command | Status | Notes |
 | --- | --- | --- |
 | `dep add` | done | `--type` (default `blocks`). |
-| `dep remove` (alias `rm`) | done | |
+| `dep remove` (alias `rm`) | done | `--type` (default `blocks`), and it is **not optional in the seam**: two beads may be joined by several edges at once, so a delete keyed on the pair alone silently destroys all of them. |
 | `dep list` | done | Both directions. |
 | `dep tree` | done | ASCII tree, `--depth`. Iterative, not recursive: the graph is not guaranteed acyclic and a cycle must not blow the stack. Repeated nodes are marked, not re-expanded. |
 | `dep cycles` | done | |
-| `dep relate` / `dep unrelate` | stub | |
+| `dep relate` / `dep unrelate` | done | `unrelate` was unwritable until `remove_dependency` took an edge type — dropping "the relation" would have dropped whatever else joined the two beads, including the edge blocking one on the other. |
 | `graph` / `graph check` | stub | |
 | `flatten` | stub | |
 | `recompute-blocked` | done | |
@@ -150,7 +150,7 @@ above.
 | `repo add/remove/list/sync` | stub | |
 | `ado`, `jira`, `linear`, `github`, `gitlab`, `notion` (each `sync/status/push/pull`) | stub | 24 leaves, one shared `TrackerCmd`. |
 | `mail` | stub | |
-| `ship` | stub | |
+| `ship` | done | `bd ship <capability> [--force] [--dry-run]`. Promotes an `export:<cap>` label to `provides:<cap>` once the work is closed. Refuses to publish over open work without `--force`: a `provides:` label is a promise other repos build against. |
 
 ## Setup
 

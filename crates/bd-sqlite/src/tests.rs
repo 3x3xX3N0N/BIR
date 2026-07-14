@@ -348,11 +348,54 @@ async fn removing_an_edge_frees_the_depender() {
     dep(&*s, "bd-b", "bd-a", DependencyType::Blocks).await;
     assert_eq!(blocked_ids(&*s).await, vec!["bd-b"]);
 
-    s.remove_dependency("bd-b", "bd-a").await.unwrap();
+    s.remove_dependency("bd-b", "bd-a", &DependencyType::Blocks)
+        .await
+        .unwrap();
     assert_eq!(blocked_ids(&*s).await, Vec::<String>::new());
     assert!(s.dependencies_of("bd-b").await.unwrap().is_empty());
     assert!(matches!(
-        s.remove_dependency("bd-b", "bd-a").await,
+        s.remove_dependency("bd-b", "bd-a", &DependencyType::Blocks)
+            .await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// **Data loss.** Two beads may be joined by several edges at once — the schema's
+/// primary key says so — so a delete keyed on the pair alone takes all of them.
+///
+/// `bd dep remove A B` was therefore a way to destroy an edge you never named,
+/// silently, while reporting success. Nothing in the graph says an edge used to
+/// be there.
+#[tokio::test]
+async fn removing_one_edge_type_leaves_the_other_edges_between_the_pair_alone() {
+    let (_d, s) = ws().await;
+    mk(&*s, "bd-a").await;
+    mk(&*s, "bd-b").await;
+
+    dep(&*s, "bd-b", "bd-a", DependencyType::Blocks).await;
+    dep(&*s, "bd-b", "bd-a", DependencyType::Related).await;
+    assert_eq!(s.dependencies_of("bd-b").await.unwrap().len(), 2);
+
+    s.remove_dependency("bd-b", "bd-a", &DependencyType::Blocks)
+        .await
+        .unwrap();
+
+    let left = s.dependencies_of("bd-b").await.unwrap();
+    assert_eq!(
+        left.len(),
+        1,
+        "removing the `blocks` edge also destroyed the `related` one: {left:?}"
+    );
+    assert_eq!(left[0].dep_type, DependencyType::Related);
+    // And the gate really did lift — this is not passing because nothing was
+    // deleted at all.
+    assert_eq!(blocked_ids(&*s).await, Vec::<String>::new());
+
+    // An edge that is not there is an error, not a shrug: a typo'd edge type
+    // must not report that it removed something.
+    assert!(matches!(
+        s.remove_dependency("bd-b", "bd-a", &DependencyType::Blocks)
+            .await,
         Err(Error::NotFound(_))
     ));
 }
@@ -477,6 +520,98 @@ async fn renewing_somebody_elses_claim_is_refused() {
         bob.renew_claim("bd-a", Duration::hours(2)).await,
         Err(Error::AlreadyClaimed { .. })
     ));
+}
+
+/// Renewing a claim nobody holds is not a *conflict*, and calling it one is how
+/// `bd heartbeat` on an unclaimed bead came to report "already claimed by ''" —
+/// which reads as a race with a nameless agent and sends you looking for it.
+#[tokio::test]
+async fn renewing_a_claim_nobody_holds_says_nobody_holds_it() {
+    let (_d, s) = ws().await;
+    mk(&*s, "bd-a").await;
+
+    match s.renew_claim("bd-a", Duration::hours(1)).await {
+        Err(Error::NotClaimed(id)) => assert_eq!(id, "bd-a"),
+        Err(Error::AlreadyClaimed { holder, .. }) => {
+            panic!("an unclaimed issue was reported as claimed by {holder:?}")
+        }
+        other => panic!("expected NotClaimed, got {other:?}"),
+    }
+
+    // A missing issue is still a missing issue, not an unclaimed one.
+    assert!(matches!(
+        s.renew_claim("bd-ghost", Duration::hours(1)).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// **`bd ready` means claimable.**
+///
+/// An issue another agent took five minutes ago is not claimable — `claim_issue`
+/// will fence a second agent out of it — so listing it hands two agents the same
+/// bead and lets one of them discover the collision after it has started work.
+///
+/// The other half is what keeps leases honest: once the lease *lapses*, the work
+/// must come back on its own. That is the whole reason a claim is a lease and not
+/// a lock, and it is what makes a dead agent's work recoverable without anyone
+/// noticing it died.
+#[tokio::test]
+async fn ready_hides_work_that_is_held_and_returns_it_when_the_lease_lapses() {
+    let (dir, alice) = ws().await;
+    let bob = as_other(&dir, "bob").await;
+
+    mk(&*alice, "bd-free").await;
+    mk(&*alice, "bd-held").await;
+    mk(&*alice, "bd-lapsed").await;
+
+    alice.claim_issue("bd-held", Duration::hours(1)).await.unwrap();
+    // A lease that has already expired by the time anyone reads it: a dead agent,
+    // without the wait.
+    alice
+        .claim_issue("bd-lapsed", Duration::seconds(-1))
+        .await
+        .unwrap();
+
+    let mut ids = ready_ids(&*bob).await;
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["bd-free", "bd-lapsed"],
+        "a live lease is a claim and must keep the bead out of `bd ready`; \
+         a lapsed one is not and must not"
+    );
+
+    // The count has to agree with the list. `bd status` and `bd prime` read the
+    // count, and a board that says "2 ready" over a list of one is worse than
+    // either number alone.
+    assert_eq!(bob.stats().await.unwrap().ready, 2);
+
+    // The holder does not get a private view of it either: finding your own
+    // in-flight work is `bd prime`'s job, not `bd ready`'s.
+    assert!(!ready_ids(&*alice).await.contains(&"bd-held".to_string()));
+
+    // And releasing it puts it straight back on offer.
+    alice.release_claim("bd-held").await.unwrap();
+    let mut ids = ready_ids(&*bob).await;
+    ids.sort();
+    assert_eq!(ids, vec!["bd-free", "bd-held", "bd-lapsed"]);
+}
+
+/// A claimed bead that a new edge has since gated must still show up in
+/// `bd blocked`. The lease term belongs to the *ready* side only: hiding held
+/// work from `bd blocked` too would make the gate invisible to everybody,
+/// including the agent holding it.
+#[tokio::test]
+async fn blocked_work_still_shows_a_bead_somebody_is_holding() {
+    let (_d, s) = ws().await;
+    mk(&*s, "bd-a").await;
+    mk(&*s, "bd-b").await;
+
+    s.claim_issue("bd-b", Duration::hours(1)).await.unwrap();
+    dep(&*s, "bd-b", "bd-a", DependencyType::Blocks).await;
+
+    assert_eq!(blocked_ids(&*s).await, vec!["bd-b"]);
+    assert!(!ready_ids(&*s).await.contains(&"bd-b".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +991,9 @@ async fn every_mutation_leaves_an_event_behind() {
     s.remove_label("bd-a", "urgent").await.unwrap();
     s.add_comment("bd-a", "hi").await.unwrap();
     dep(&*s, "bd-a", "bd-b", DependencyType::Blocks).await;
-    s.remove_dependency("bd-a", "bd-b").await.unwrap();
+    s.remove_dependency("bd-a", "bd-b", &DependencyType::Blocks)
+        .await
+        .unwrap();
     s.close_issue("bd-a", "done").await.unwrap();
     s.reopen_issue("bd-a").await.unwrap();
 
@@ -903,9 +1040,324 @@ async fn stats_count_what_an_agent_cares_about() {
     assert_eq!(st.in_progress, 1);
     assert_eq!(st.closed, 0);
     assert_eq!(st.blocked, 1); // bd-b
-    assert_eq!(st.ready, 2); // bd-a, bd-c
+    // bd-a, and only bd-a: bd-b is gated by the graph, and bd-c is held under a
+    // live lease, which is not claimable work however much it looks like it.
+    assert_eq!(st.ready, 1);
     assert_eq!(st.by_priority.get(&2), Some(&3));
     assert_eq!(st.by_type.get("task"), Some(&3));
+}
+
+// ---------------------------------------------------------------------------
+// Derived state: the content hash
+// ---------------------------------------------------------------------------
+
+/// `content_hash` is the answer to "are these two beads the same bead" across
+/// clones, and it is what an import dedups on. A hash computed once at create and
+/// never refreshed describes content the issue no longer has — so an edited bead
+/// stops matching itself, and keeps matching whatever it used to say.
+///
+/// Every write below moves something the hash covers. `compute_content_hash` in
+/// bd-core is the authority on what that is; this test asks the store to agree
+/// with it after each one.
+#[tokio::test]
+async fn content_hash_follows_the_content_through_every_write() {
+    let (_d, s) = ws().await;
+
+    #[track_caller]
+    fn agrees(i: &Issue, after: &str) {
+        assert_eq!(
+            i.content_hash,
+            i.compute_content_hash(),
+            "the stored content_hash describes content the issue no longer has, after {after}"
+        );
+    }
+
+    let created = s.create_issue(&Issue::new("bd-a", "before")).await.unwrap();
+    agrees(&created, "create");
+    let first = created.content_hash.clone();
+
+    let renamed = s
+        .update_issue(
+            "bd-a",
+            &IssuePatch {
+                title: Some("after".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    agrees(&renamed, "update");
+    assert_ne!(renamed.content_hash, first, "the content changed; the hash did not");
+
+    // Labels are hashed too — `compute_content_hash` sorts and folds them in —
+    // so they are a write path of their own.
+    s.add_label("bd-a", "infra").await.unwrap();
+    agrees(&s.get_issue("bd-a").await.unwrap().unwrap(), "add_label");
+    s.remove_label("bd-a", "infra").await.unwrap();
+    agrees(&s.get_issue("bd-a").await.unwrap().unwrap(), "remove_label");
+
+    // A claim moves the assignee and the status.
+    s.claim_issue("bd-a", Duration::hours(1)).await.unwrap();
+    agrees(&s.get_issue("bd-a").await.unwrap().unwrap(), "claim");
+    s.release_claim("bd-a").await.unwrap();
+    agrees(&s.get_issue("bd-a").await.unwrap().unwrap(), "release");
+
+    let closed = s.close_issue("bd-a", "done").await.unwrap();
+    agrees(&closed, "close");
+    let reopened = s.reopen_issue("bd-a").await.unwrap();
+    agrees(&reopened, "reopen");
+
+    // The round trip settles: the same content hashes the same way it did before
+    // any of this happened.
+    assert_eq!(
+        reopened.content_hash,
+        Issue {
+            title: "after".into(),
+            ..Issue::new("bd-a", "after")
+        }
+        .compute_content_hash()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Comments: ids have to mean the same thing in two workspaces
+// ---------------------------------------------------------------------------
+
+/// **Silent corruption.** `upsert_comment` treats the incoming id as the
+/// comment's identity — that is what makes `bd import` idempotent. A
+/// workspace-local integer id is not an identity: two workspaces that have each
+/// ever written a comment both hold a comment `1`, so importing A's export into B
+/// overwrites B's comment with A's text *and* re-parents it onto A's issue.
+///
+/// Nothing errors. B's comment is simply gone, and the one wearing its id belongs
+/// to someone else.
+#[tokio::test]
+async fn a_comment_from_another_workspace_cannot_overwrite_a_local_one() {
+    let (_da, a) = workspace("alice").await;
+    let (_db, b) = workspace("bob").await;
+
+    // Two independent workspaces, each with its own first comment.
+    mk(&*a, "a-1").await;
+    let from_a = a.add_comment("a-1", "alice said this").await.unwrap();
+
+    mk(&*b, "b-1").await;
+    let from_b = b.add_comment("b-1", "bob said this").await.unwrap();
+
+    assert_ne!(
+        from_a.id, from_b.id,
+        "two workspaces minted the same comment id; one of them is about to lose a comment"
+    );
+
+    // Now import A into B, exactly as `bd import` does: the issue, then the
+    // comment, keyed on its own id.
+    b.create_issue(&a.get_issue("a-1").await.unwrap().unwrap())
+        .await
+        .unwrap();
+    b.upsert_comment(&from_a).await.unwrap();
+
+    // B's own comment must be untouched, and still attached to B's own issue.
+    let bs = b.list_comments("b-1").await.unwrap();
+    assert_eq!(bs.len(), 1, "b-1 lost its comment to the import: {bs:?}");
+    assert_eq!(bs[0].id, from_b.id);
+    assert_eq!(bs[0].text, "bob said this");
+    assert_eq!(bs[0].author, "bob");
+
+    // And A's comment landed where it belongs, with its author intact.
+    let as_ = b.list_comments("a-1").await.unwrap();
+    assert_eq!(as_.len(), 1);
+    assert_eq!(as_[0].text, "alice said this");
+    assert_eq!(as_[0].author, "alice");
+
+    // Re-importing is a no-op, which is the property the id-as-identity buys.
+    b.upsert_comment(&from_a).await.unwrap();
+    assert_eq!(b.list_comments("a-1").await.unwrap().len(), 1);
+}
+
+/// A thread is ordered by *time*. Comment ids are UUIDs now, so an ORDER BY id
+/// would shuffle the conversation — and a shuffled conversation reads as a
+/// different one.
+#[tokio::test]
+async fn comments_come_back_in_the_order_they_were_written() {
+    let (_d, s) = ws().await;
+    mk(&*s, "bd-a").await;
+
+    for text in ["first", "second", "third", "fourth", "fifth"] {
+        s.add_comment("bd-a", text).await.unwrap();
+    }
+
+    let texts: Vec<String> = s
+        .list_comments("bd-a")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.text)
+        .collect();
+    assert_eq!(texts, ["first", "second", "third", "fourth", "fifth"]);
+}
+
+// ---------------------------------------------------------------------------
+// The batched seams
+// ---------------------------------------------------------------------------
+
+/// Without these, `children`, `epic`, `orphans`, `lint` and `export` are all
+/// N+1 — and the only alternative on the old seam was to scan the whole
+/// workspace to answer a question about four beads.
+#[tokio::test]
+async fn the_batched_getters_answer_in_one_query_and_in_the_callers_order() {
+    let (_d, s) = ws().await;
+    for id in ["bd-a", "bd-b", "bd-c"] {
+        mk(&*s, id).await;
+    }
+    dep(&*s, "bd-a", "bd-b", DependencyType::Blocks).await;
+    dep(&*s, "bd-a", "bd-c", DependencyType::Related).await;
+    dep(&*s, "bd-b", "bd-c", DependencyType::Blocks).await;
+    s.add_comment("bd-a", "one").await.unwrap();
+    s.add_comment("bd-a", "two").await.unwrap();
+    s.add_comment("bd-b", "three").await.unwrap();
+
+    // get_issues: the caller's order, and a missing id is a gap rather than an
+    // error — asking about a bead somebody deleted is ordinary.
+    let got = s
+        .get_issues(&["bd-c".into(), "bd-a".into(), "bd-gone".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["bd-c", "bd-a"]
+    );
+    assert!(s.get_issues(&[]).await.unwrap().is_empty());
+
+    // list_dependencies: the whole edge set, in one query.
+    let all = s.list_dependencies(&IssueFilter::new()).await.unwrap();
+    assert_eq!(all.len(), 3);
+
+    // …or the edges out of the issues a filter selects.
+    let f = IssueFilter {
+        text: Some("issue bd-a".into()),
+        ..IssueFilter::new()
+    };
+    let out_of_a = s.list_dependencies(&f).await.unwrap();
+    assert_eq!(out_of_a.len(), 2);
+    assert!(out_of_a.iter().all(|d| d.issue_id == "bd-a"));
+
+    // dependencies_of_many / comments_of_many: keyed, and ids with nothing are
+    // simply absent rather than present-and-empty.
+    let deps = s
+        .dependencies_of_many(&["bd-a".into(), "bd-c".into()])
+        .await
+        .unwrap();
+    assert_eq!(deps.len(), 1, "bd-c has no out-edges: {deps:?}");
+    assert_eq!(deps[0].0, "bd-a");
+    assert_eq!(deps[0].1.len(), 2);
+
+    let comments = s
+        .comments_of_many(&["bd-a".into(), "bd-b".into(), "bd-c".into()])
+        .await
+        .unwrap();
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[0].0, "bd-a");
+    assert_eq!(
+        comments[0].1.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+        ["one", "two"],
+        "a batched read must keep a thread in order too"
+    );
+    assert!(s.comments_of_many(&[]).await.unwrap().is_empty());
+}
+
+/// The two sort policies whose whole reason for existing is that their consumers
+/// were sorting in memory — which is only ever safe until somebody adds a
+/// `--limit`, at which point the database pages one order and the answer is
+/// re-sorted into another.
+#[tokio::test]
+async fn updated_and_closed_sort_in_sql_so_a_limit_pages_the_right_rows() {
+    let (_d, s) = ws().await;
+    let now = Utc::now();
+
+    // Created newest-first, so that a sort by *creation* would produce the exact
+    // opposite order and this test could not pass by accident.
+    for (n, id) in ["bd-1", "bd-2", "bd-3"].iter().enumerate() {
+        let mut i = Issue::new(*id, *id);
+        i.created_at = now - Duration::days(n as i64);
+        i.updated_at = i.created_at;
+        s.create_issue(&i).await.unwrap();
+    }
+    // Touch bd-3, so it is the *most* recently updated despite being the oldest.
+    s.update_issue(
+        "bd-3",
+        &IssuePatch {
+            title: Some("touched".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let ids = |v: Vec<Issue>| -> Vec<String> { v.into_iter().map(|i| i.id).collect() };
+
+    // Least-recently-touched first: that is the question `bd stale` asks.
+    let stale = s
+        .list_issues(&IssueFilter {
+            sort: SortPolicy::Updated,
+            ..IssueFilter::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(stale), ["bd-2", "bd-1", "bd-3"]);
+
+    // And with a LIMIT the database must hand back the *first page of that
+    // order*, not the first page of some other order re-sorted afterwards.
+    let page = s
+        .list_issues(&IssueFilter {
+            sort: SortPolicy::Updated,
+            limit: Some(1),
+            ..IssueFilter::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(page), ["bd-2"]);
+
+    s.close_issue("bd-1", "done").await.unwrap();
+    s.close_issue("bd-2", "done").await.unwrap();
+
+    // Most-recently-closed first — the opposite direction, because it answers the
+    // opposite question. Open issues have no close time and fall to the end.
+    let closed = s
+        .list_issues(&IssueFilter {
+            sort: SortPolicy::Closed,
+            ..IssueFilter::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(closed), ["bd-2", "bd-1", "bd-3"]);
+}
+
+/// `bd promote`: a wisp becomes a real bead.
+///
+/// Both fields have to move. An ephemeral bead is hidden from `bd ready`, and a
+/// bead that still declares a `wisp_type` still has that type's TTL — so clearing
+/// only one of them yields work that is either invisible or that `bd gc` deletes
+/// out from under whoever claimed it.
+#[tokio::test]
+async fn promoting_a_wisp_clears_both_the_flag_and_the_ttl() {
+    let (_d, s) = ws().await;
+
+    let mut wisp = Issue::new("bd-w", "a recovery wisp");
+    wisp.ephemeral = true;
+    wisp.wisp_type = Some(bd_core::WispType::Recovery);
+    s.create_issue(&wisp).await.unwrap();
+
+    assert!(
+        !ready_ids(&*s).await.contains(&"bd-w".to_string()),
+        "an ephemeral bead is never claimable work"
+    );
+
+    let promoted = s.update_issue("bd-w", &IssuePatch::promote()).await.unwrap();
+    assert!(!promoted.ephemeral);
+    assert_eq!(
+        promoted.wisp_type, None,
+        "a promoted bead that kept its wisp type still has that type's TTL, and gc will reap it"
+    );
+    assert_eq!(ready_ids(&*s).await, vec!["bd-w"]);
 }
 
 #[tokio::test]

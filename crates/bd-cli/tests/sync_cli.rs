@@ -42,6 +42,10 @@ fn exported(dir: &Path, id: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("{id} is missing from the export"))
 }
 
+/// A stand-in for "this issue has no comments at all", so a missing key and an
+/// empty list read the same way at the assertion.
+static EMPTY: Vec<serde_json::Value> = Vec::new();
+
 fn comment_authors(record: &serde_json::Value) -> Vec<String> {
     record["comments"]
         .as_array()
@@ -136,6 +140,71 @@ fn importing_twice_restores_comments_once_and_keeps_their_authors() {
     cleanup(&[src, dst]);
 }
 
+/// **The import that eats the importer's own comments.**
+///
+/// The test above imports into a *fresh* workspace, which is the easy case. This
+/// one imports into a workspace that already has comments of its own — the case
+/// that actually happens, and the one that used to corrupt data.
+///
+/// Comment ids used to be workspace-local `AUTOINCREMENT` integers, so two
+/// workspaces that had each ever written a comment both held a comment `1`.
+/// `upsert_comment` keys on the id, so importing A's export into B overwrote B's
+/// comment with A's text *and* re-parented it onto A's issue. No error, no
+/// conflict, no duplicate: B's comment was simply gone, and the row wearing its
+/// id belonged to someone else.
+#[test]
+fn importing_into_a_workspace_that_has_its_own_comments_overwrites_none_of_them() {
+    let src = tempdir("sync-collide-src");
+    let dst = tempdir("sync-collide-dst");
+
+    // Two workspaces built entirely independently. Each has an issue, and each
+    // has written its own first comment — so under a workspace-local id scheme
+    // both of those comments are id `1`.
+    assert_eq!(run_as(&src, "alice", &["init", "--prefix", "s"]).1, 0);
+    let (theirs, code) = run_as(&src, "alice", &["q", "Their work"]);
+    assert_eq!(code, 0);
+    assert_eq!(run_as(&src, "alice", &["comment", &theirs, "alice's note"]).1, 0);
+
+    assert_eq!(run_as(&dst, "bob", &["init", "--prefix", "d"]).1, 0);
+    let (ours, code) = run_as(&dst, "bob", &["q", "Our work"]);
+    assert_eq!(code, 0);
+    assert_eq!(run_as(&dst, "bob", &["comment", &ours, "bob's note"]).1, 0);
+
+    let dump = src.join("dump.jsonl");
+    assert_eq!(
+        run_as(&src, "alice", &["export", "-o", dump.to_str().unwrap()]).1,
+        0
+    );
+
+    let (out, code) = run_as(&dst, "bob", &["--json", "import", dump.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+
+    // Ours is untouched: same text, same author, still on our issue.
+    let ours_record = exported(&dst, &ours);
+    let ours_comments = ours_record["comments"].as_array().unwrap_or(&EMPTY);
+    assert_eq!(
+        ours_comments.len(),
+        1,
+        "the import destroyed our own comment: {ours_record}"
+    );
+    assert_eq!(ours_comments[0]["text"], "bob's note");
+    assert_eq!(ours_comments[0]["author"], "bob");
+    assert_eq!(
+        ours_comments[0]["issue_id"], ours,
+        "our comment was re-parented onto the imported issue"
+    );
+
+    // And theirs landed on their issue, not ours.
+    let theirs_record = exported(&dst, &theirs);
+    let theirs_comments = theirs_record["comments"].as_array().unwrap_or(&EMPTY);
+    assert_eq!(theirs_comments.len(), 1);
+    assert_eq!(theirs_comments[0]["text"], "alice's note");
+    assert_eq!(theirs_comments[0]["author"], "alice");
+    assert_eq!(theirs_comments[0]["issue_id"], theirs);
+
+    cleanup(&[src, dst]);
+}
+
 /// `--dry-run` reports what it would do and touches nothing.
 #[test]
 fn a_dry_run_import_reports_comments_but_writes_none() {
@@ -171,6 +240,58 @@ fn a_dry_run_import_reports_comments_but_writes_none() {
     assert!(jsonl.trim().is_empty(), "a dry run wrote to the database: {jsonl}");
 
     cleanup(&[src, dst]);
+}
+
+/// `bd ship <capability>` promotes an `export:` label to a `provides:` label.
+///
+/// The closed check is the command. A `provides:` label is a promise other repos
+/// build against, so publishing one over work that is still open advertises
+/// something that does not exist — and the projects that believed it find out at
+/// their own build time, not yours.
+#[test]
+fn ship_publishes_a_capability_only_once_its_work_is_closed() {
+    let tmp = tempdir("sync-ship");
+    assert_eq!(run_as(&tmp, "alice", &["init", "--prefix", "s"]).1, 0);
+
+    let (id, code) = run_as(&tmp, "alice", &["q", "Build the parser"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        run_as(&tmp, "alice", &["label", "add", &id, "export:parser"]).1,
+        0
+    );
+
+    // Still open: refuse, and say why.
+    let (_, code) = run_as(&tmp, "alice", &["ship", "parser"]);
+    assert_eq!(code, 1, "shipping unfinished work must not succeed quietly");
+
+    // --dry-run reports and writes nothing, even when it would have worked.
+    let (out, code) = run_as(&tmp, "alice", &["--json", "ship", "parser", "--force", "--dry-run"]);
+    assert_eq!(code, 0, "{out}");
+    let doc: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+    assert_eq!(doc["dry_run"], true);
+    let labels = run_as(&tmp, "alice", &["--json", "label", "list", &id]).0;
+    assert!(
+        !labels.contains("provides:parser"),
+        "a dry run published the capability: {labels}"
+    );
+
+    // Close it, and it ships.
+    assert_eq!(run_as(&tmp, "alice", &["close", &id]).1, 0);
+    let (out, code) = run_as(&tmp, "alice", &["--json", "ship", "parser"]);
+    assert_eq!(code, 0, "{out}");
+    let doc: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+    assert_eq!(doc["label"], "provides:parser");
+    assert_eq!(doc["issues"][0], id.as_str());
+
+    let labels = run_as(&tmp, "alice", &["--json", "label", "list", &id]).0;
+    assert!(labels.contains("provides:parser"), "{labels}");
+
+    // A capability nobody has labelled is an error, not an empty success: it is
+    // almost always a typo, and reporting "shipped 0 issues" would hide it.
+    let (_, code) = run_as(&tmp, "alice", &["ship", "nonesuch"]);
+    assert_eq!(code, 1);
+
+    cleanup(&[tmp]);
 }
 
 /// Federation needs peers, remotes, and a commit graph to exchange. SQLite has

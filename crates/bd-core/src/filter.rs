@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{IssueType, Priority, Status};
 
-/// How `bd ready` orders claimable work.
+/// How a listing orders its results.
+///
+/// Every variant is pushed into SQL's `ORDER BY`. That is not an optimization:
+/// a sort applied in memory *after* the database applied a `LIMIT` returns the
+/// wrong page, silently, and nothing about the output says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SortPolicy {
@@ -13,6 +17,15 @@ pub enum SortPolicy {
     Hybrid,
     Priority,
     Oldest,
+
+    // The next two point in *opposite* directions, and each one points the way
+    // its question does. They are not a symmetric pair and must not be made one.
+    /// Least-recently-updated first. The order `bd stale` asks for: "what has
+    /// nobody touched?" — so the answer starts with what nobody touched longest.
+    Updated,
+    /// Most-recently-closed first. The order "what did we just finish?" asks for.
+    /// Issues that are still open have no close time and sort last.
+    Closed,
 }
 
 impl SortPolicy {
@@ -27,6 +40,8 @@ impl std::str::FromStr for SortPolicy {
             "hybrid" => Ok(SortPolicy::Hybrid),
             "priority" => Ok(SortPolicy::Priority),
             "oldest" => Ok(SortPolicy::Oldest),
+            "updated" => Ok(SortPolicy::Updated),
+            "closed" => Ok(SortPolicy::Closed),
             other => Err(crate::Error::Invalid(format!("unknown sort policy: {other}"))),
         }
     }
@@ -104,6 +119,19 @@ pub struct IssueFilter {
     /// `Some(false)`.
     pub is_blocked: Option<bool>,
 
+    /// Whether the issue is under an **unexpired** lease.
+    ///
+    /// A lease that has lapsed is not a claim: the agent holding it is presumed
+    /// dead, and the work returns to whoever asks for it next. So this is a
+    /// predicate about the *clock*, not about the `lease_expires_at` column
+    /// being set — an issue with a lease that expired an hour ago answers
+    /// `false` here, which is what makes leases self-healing.
+    ///
+    /// `Some(false)` is what `bd ready` needs: an issue somebody currently holds
+    /// is not claimable, so offering it to a second agent is how two agents end
+    /// up doing the same work.
+    pub lease_active: Option<bool>,
+
     pub sort: SortPolicy,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -114,14 +142,22 @@ impl IssueFilter {
         Self::default()
     }
 
-    /// The filter behind `bd ready`: workable, unblocked, not deferred, not
-    /// pinned, and not an infrastructure bead.
+    /// The filter behind `bd ready`: workable, unblocked, unheld, not deferred,
+    /// not pinned, and not an infrastructure bead.
+    ///
+    /// `lease_active: Some(false)` is the one that is easy to leave out and
+    /// expensive to leave out. `bd ready` means *claimable*, and an issue whose
+    /// lease is still running is claimed — `claim_issue` will refuse it. Showing
+    /// it anyway hands two agents the same bead and lets one of them find out by
+    /// failing. Note the complement is *not* "my own work": an agent looking for
+    /// what it already holds is asking `bd prime`, not `bd ready`.
     pub fn ready() -> Self {
         IssueFilter {
             statuses: vec![Status::Open, Status::InProgress],
             is_blocked: Some(false),
             pinned: Some(false),
             ephemeral: Some(false),
+            lease_active: Some(false),
             ..Default::default()
         }
     }

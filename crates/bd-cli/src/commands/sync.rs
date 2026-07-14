@@ -9,6 +9,7 @@ use bd_core::{Comment, Dependency, Issue, IssueFilter, Status};
 use bd_storage::{Field, IssuePatch};
 use serde_json::{Value, json};
 
+
 use crate::cli::{
     DoltCmd, DoltRemoteCmd, ExportArgs, FederationCmd, ImportArgs, RepoCmd, TrackerCmd, VcCmd,
 };
@@ -35,12 +36,16 @@ pub async fn export(ctx: &Ctx, a: ExportArgs) -> Result<()> {
     // one for a backup, so they get hydrated here — an export that loses labels
     // is not a backup.
     //
-    // Labels arrive for the whole listing in a single query. Edges and comments
-    // still cost one apiece: the seam has no batched form of either, so that is
-    // the N+1 that remains, and it is bounded by the size of the export itself.
+    // Three batched queries for the whole export, not three per issue. Each of
+    // these getters omits ids that carry nothing, so a miss is ordinary rather
+    // than an error.
     let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
     let mut labels: HashMap<String, Vec<String>> =
         store.labels_of(&ids).await?.into_iter().collect();
+    let mut deps: HashMap<String, Vec<Dependency>> =
+        store.dependencies_of_many(&ids).await?.into_iter().collect();
+    let mut comments: HashMap<String, Vec<Comment>> =
+        store.comments_of_many(&ids).await?.into_iter().collect();
 
     let mut w: Box<dyn Write> = match &a.output {
         Some(p) => Box::new(BufWriter::new(
@@ -50,11 +55,9 @@ pub async fn export(ctx: &Ctx, a: ExportArgs) -> Result<()> {
     };
 
     for issue in &mut issues {
-        // `labels_of` omits ids that carry no labels at all, so a miss is
-        // ordinary rather than an error.
         issue.labels = labels.remove(&issue.id).unwrap_or_default();
-        issue.dependencies = store.dependencies_of(&issue.id).await?;
-        issue.comments = store.list_comments(&issue.id).await?;
+        issue.dependencies = deps.remove(&issue.id).unwrap_or_default();
+        issue.comments = comments.remove(&issue.id).unwrap_or_default();
         writeln!(w, "{}", serde_json::to_string(&export_record(issue)?)?)?;
     }
     w.flush()?;
@@ -209,6 +212,11 @@ fn patch_from(i: &Issue) -> IssuePatch {
         spec_id: Field::Set(i.spec_id.clone()),
         external_ref: Field::authoritative(i.external_ref.clone()),
         pinned: Some(i.pinned),
+        // A record that no longer says `ephemeral` is a record of a bead that was
+        // promoted upstream. Keeping the old flag would leave a bead the peer
+        // considers real invisible to `bd ready` here, and still on gc's list.
+        ephemeral: Some(i.ephemeral),
+        wisp_type: Field::authoritative(i.wisp_type),
     }
 }
 
@@ -393,17 +401,78 @@ pub async fn repo(ctx: &Ctx, cmd: RepoCmd) -> Result<()> {
 }
 
 /// Publish a capability so other projects can depend on it: find the issue
-/// labelled `export:<capability>`, check it is closed, label it
+/// labelled `export:<capability>`, check it is closed, and label it
 /// `provides:<capability>`.
 ///
-/// The store can do every part of that today — `labels_all` pushes the lookup
-/// down, `add_label` does the write. What is missing is the *argument*: `bd
-/// ship` takes a mandatory `<capability>` (plus `--force` and `--dry-run`), and
-/// the command tree declares it as a bare `Ship` with no fields. There is no
-/// capability to ship, so there is nothing honest to do but say so.
-///
-/// See the report: this needs one `cli.rs` change and one `mod.rs` line, after
-/// which the body is about fifteen lines.
-pub async fn ship(ctx: &Ctx) -> Result<()> {
-    stub("ship", ctx)
+/// The `provides:` label is a *promise to other repos*, so the closed check is
+/// the whole command. Shipping a capability whose work is still open advertises
+/// something that does not exist yet, and the projects that believed you find
+/// out at their own build time. `--force` exists because there are real reasons
+/// to make that promise early — but it must be said out loud, not defaulted to.
+pub async fn ship(ctx: &Ctx, capability: &str, force: bool, dry_run: bool) -> Result<()> {
+    if !dry_run {
+        ctx.ensure_writable("ship a capability")?;
+    }
+    let store = ctx.store().await?;
+
+    let capability = capability.trim();
+    if capability.is_empty() {
+        bail!("a capability needs a name");
+    }
+    let export = format!("export:{capability}");
+    let provides = format!("provides:{capability}");
+
+    // Pushed down: `labels_all` is a subquery on the labels table, not a scan.
+    let issues = store
+        .list_issues(&IssueFilter {
+            labels_all: vec![export.clone()],
+            ..IssueFilter::new()
+        })
+        .await?;
+
+    if issues.is_empty() {
+        bail!(
+            "nothing is labelled `{export}`, so there is no work to ship.\n\
+             Label the issue that delivers it: `bd label add <id> {export}`"
+        );
+    }
+
+    let open: Vec<&Issue> = issues.iter().filter(|i| !i.status.is_closed()).collect();
+    if !open.is_empty() && !force {
+        let ids: Vec<&str> = open.iter().map(|i| i.id.as_str()).collect();
+        bail!(
+            "`{capability}` is not finished: {} is still open.\n\
+             A `provides:` label is a promise other repos build against — close the work, \
+             or pass --force to make the promise anyway.",
+            ids.join(", ")
+        );
+    }
+
+    if !dry_run {
+        for i in &issues {
+            store.add_label(&i.id, &provides).await?;
+        }
+    }
+
+    let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+    if ctx.out.is_json() {
+        return ctx.out.json_value(&json!({
+            "capability": capability,
+            "label": provides,
+            "issues": ids,
+            "unfinished": open.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            "forced": force && !open.is_empty(),
+            "dry_run": dry_run,
+        }));
+    }
+    let verb = if dry_run { "Would ship" } else { "Shipped" };
+    ctx.out
+        .line(format!("{verb} `{capability}` ({}): {}", provides, ids.join(", ")));
+    if !open.is_empty() {
+        ctx.out.warn(format!(
+            "{} issue(s) are still open; `{capability}` was published anyway (--force)",
+            open.len()
+        ));
+    }
+    Ok(())
 }

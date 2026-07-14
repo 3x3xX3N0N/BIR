@@ -185,6 +185,97 @@ fn the_view_commands_agree_about_one_graph() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **`bd ready` means claimable.**
+///
+/// beads exists to coordinate several agents over one board. An issue another
+/// agent claimed five minutes ago is not claimable — `bd update --claim` will
+/// fence a second agent out of it — so listing it in `bd ready` hands two agents
+/// the same bead and lets one of them discover the collision after it has read
+/// the issue and started thinking.
+///
+/// The other half is what makes a lease a lease and not a lock: once it lapses,
+/// the work comes back on its own, without anyone having to notice that the agent
+/// holding it died.
+#[test]
+fn ready_does_not_offer_work_another_agent_is_already_holding() {
+    let dir = tempdir("held");
+    let d = dir.to_str().unwrap();
+    assert_eq!(bd(d, &["init", "--prefix", "h"]).2, 0, "init");
+
+    let as_agent = |actor: &str, args: &[&str]| -> (String, i32) {
+        let out = Command::new(env!("CARGO_BIN_EXE_bd"))
+            .args(["-C", d])
+            .args(args)
+            .env("BEADS_ACTOR", actor)
+            .output()
+            .expect("run bd");
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+
+    let free = as_agent("alice", &["q", "Nobody has this"]).0;
+    let held = as_agent("alice", &["q", "Alice is on this"]).0;
+    let lapsed = as_agent("alice", &["q", "Alice died holding this"]).0;
+
+    assert_eq!(as_agent("alice", &["update", &held, "--claim"]).1, 0);
+    // A zero-length lease is one that has already lapsed by the time anyone reads
+    // it: a dead agent, without the wait.
+    assert_eq!(
+        as_agent("alice", &["update", &lapsed, "--claim", "--lease", "0s"]).1,
+        0
+    );
+
+    // Bob asks what he can work on.
+    let ready = as_agent("bob", &["--json", "ready", "--limit", "0"]).0;
+    let ready: Vec<String> = serde_json::from_str::<Value>(&ready)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        !ready.contains(&held),
+        "`bd ready` offered bob a bead alice is holding — the two of them are now \
+         about to do the same work: {ready:?}"
+    );
+    assert!(
+        ready.contains(&lapsed),
+        "a lapsed lease is not a claim: the work must come back on its own, or a \
+         dead agent holds it forever: {ready:?}"
+    );
+    assert!(ready.contains(&free));
+
+    // Alice does not get a private view of it either. Finding your own in-flight
+    // work is `bd prime`'s job — it has a `yours` section for exactly this.
+    let hers = as_agent("alice", &["--json", "ready", "--limit", "0"]).0;
+    assert!(
+        !hers.contains(&held),
+        "`bd ready` is not where an agent finds what it already claimed"
+    );
+    let prime = as_agent("alice", &["--json", "prime"]).0;
+    let prime: Value = serde_json::from_str(&prime).unwrap();
+    assert_eq!(
+        prime["yours"][0]["id"], held,
+        "…and `bd prime` is: {prime}"
+    );
+
+    // The count has to agree with the list, or `bd status` says 3 over a board of 2.
+    let status = as_agent("bob", &["--json", "status"]).0;
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["ready"], 2, "{status}");
+
+    // And releasing it puts it straight back on offer.
+    assert_eq!(as_agent("alice", &["unclaim", &held]).1, 0);
+    let ready = as_agent("bob", &["--json", "ready", "--limit", "0"]).0;
+    assert!(ready.contains(&held), "unclaiming must return the work: {ready}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The blocked-cache staleness check has to survive the one thing that makes it
 /// interesting: a `conditional-blocks` edge whose target closed *successfully*,
 /// which the store leaves blocked forever on purpose.

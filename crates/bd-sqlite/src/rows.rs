@@ -134,7 +134,7 @@ pub fn dependency_from_row(r: &SqliteRow) -> Result<Dependency> {
 
 pub fn comment_from_row(r: &SqliteRow) -> Result<Comment> {
     Ok(Comment {
-        id: r.try_get::<i64, _>("id").map_err(dec)?.to_string(),
+        id: r.try_get("id").map_err(dec)?,
         issue_id: r.try_get("issue_id").map_err(dec)?,
         author: r.try_get("author").map_err(dec)?,
         text: r.try_get("text").map_err(dec)?,

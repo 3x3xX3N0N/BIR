@@ -31,7 +31,7 @@ pub mod locator;
 pub mod stats;
 
 use async_trait::async_trait;
-use bd_core::{Dependency, Event, Issue, IssueFilter};
+use bd_core::{Dependency, DependencyType, Event, Issue, IssueFilter};
 use chrono::{DateTime, Utc};
 
 pub use capability::{Conflict, HistoryViewer, RemoteStore, VersionControl};
@@ -199,6 +199,10 @@ pub struct IssuePatch {
     pub priority: Option<bd_core::Priority>,
     pub issue_type: Option<bd_core::IssueType>,
     pub pinned: Option<bool>,
+    /// Whether the bead lives outside the commit graph and is reaped by TTL.
+    /// Clearing this is what `bd promote` does to a wisp — and it is why
+    /// `promote` was unwritable while this field did not exist.
+    pub ephemeral: Option<bool>,
 
     // Free text: empty is a legitimate value, so these are clearable.
     pub description: Field<String>,
@@ -215,6 +219,10 @@ pub struct IssuePatch {
     pub metadata: Field<serde_json::Value>,
     pub spec_id: Field<String>,
     pub external_ref: Field<String>,
+    /// The TTL class of an ephemeral bead. Clearable, because a promoted wisp
+    /// has no TTL — leaving one behind would let `bd gc` reap the real bead it
+    /// just became.
+    pub wisp_type: Field<bd_core::WispType>,
 }
 
 impl IssuePatch {
@@ -234,6 +242,20 @@ impl IssuePatch {
     pub fn undefer() -> Self {
         IssuePatch {
             defer_until: Field::Clear,
+            ..Default::default()
+        }
+    }
+
+    /// `bd promote`: turn a wisp into a real bead.
+    ///
+    /// Both halves are required. Clearing `ephemeral` without clearing
+    /// `wisp_type` leaves a bead that `bd ready` will show and `bd gc` will
+    /// still delete out from under whoever claimed it, because the TTL is read
+    /// from the wisp type.
+    pub fn promote() -> Self {
+        IssuePatch {
+            ephemeral: Some(false),
+            wisp_type: Field::Clear,
             ..Default::default()
         }
     }
@@ -258,6 +280,20 @@ pub trait Storage: Send + Sync {
 
     async fn create_issue(&self, issue: &Issue) -> Result<Issue>;
     async fn get_issue(&self, id: &str) -> Result<Option<Issue>>;
+
+    /// Many issues by id, in one query.
+    ///
+    /// [`IssueFilter`] cannot name a set of ids, so without this a caller that
+    /// *has* ids and wants issues had two options, both bad: one `get_issue` per
+    /// id (an N+1), or a full scan indexed in memory (a scan of the workspace to
+    /// answer a question about four beads). `bd children`, `bd epic`,
+    /// `bd orphans` and `bd lint` all take ids from the graph and need the rows.
+    ///
+    /// Ids that do not exist are simply absent from the result — asking about a
+    /// bead that was deleted is ordinary, not an error. Relations are **not**
+    /// hydrated, exactly as in [`Storage::list_issues`].
+    async fn get_issues(&self, ids: &[String]) -> Result<Vec<Issue>>;
+
     async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue>;
     async fn delete_issue(&self, id: &str) -> Result<()>;
     async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>>;
@@ -287,11 +323,47 @@ pub trait Storage: Send + Sync {
     // --- dependencies ---
 
     async fn add_dependency(&self, dep: &Dependency) -> Result<()>;
-    async fn remove_dependency(&self, issue_id: &str, depends_on_id: &str) -> Result<()>;
+
+    /// Remove **one** edge: the `(issue_id, depends_on_id, dep_type)` triple.
+    ///
+    /// The type is not optional and never should have been. Two beads may
+    /// legitimately be joined by several edges at once — A `blocks` B *and* is
+    /// `related` to B is an ordinary shape — and a delete keyed on the pair
+    /// alone destroys all of them. That is silent data loss: the graph is the
+    /// product, and no error is raised when the wrong edges go.
+    ///
+    /// Removing an edge that is not there is [`Error::NotFound`], not a no-op.
+    /// A typo'd edge type must not report success.
+    async fn remove_dependency(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+    ) -> Result<()>;
+
     /// Edges *out of* this issue: what it depends on.
     async fn dependencies_of(&self, id: &str) -> Result<Vec<Dependency>>;
     /// Edges *into* this issue: what depends on it.
     async fn dependents_of(&self, id: &str) -> Result<Vec<Dependency>>;
+
+    /// The whole edge set, or the edges out of the issues a filter selects, in
+    /// one query.
+    ///
+    /// The filter selects the edges' *source* issues; an empty filter means
+    /// every edge in the graph, including any whose endpoints have gone missing.
+    /// That last part is the point of the empty case: `bd lint` and
+    /// `bd graph check` exist to find edges a foreign import or a merge left
+    /// dangling, and a loader that discovers edges by walking the issues that
+    /// exist can only ever find half of them.
+    ///
+    /// `sort`, `limit` and `offset` on the filter are ignored: a set of edges is
+    /// not a page of issues.
+    async fn list_dependencies(&self, filter: &IssueFilter) -> Result<Vec<Dependency>>;
+
+    /// Out-edges for each of `ids`, in one query. Batched for the same reason
+    /// [`Storage::labels_of`] is; ids with no edges are absent from the result.
+    async fn dependencies_of_many(&self, ids: &[String]) -> Result<Vec<(String, Vec<Dependency>)>>;
+
     /// Every cycle in the graph. Empty means the graph is a DAG.
     async fn find_cycles(&self) -> Result<Vec<Vec<String>>>;
 
@@ -324,6 +396,13 @@ pub trait Storage: Send + Sync {
     async fn upsert_comment(&self, comment: &bd_core::Comment) -> Result<()>;
 
     async fn list_comments(&self, issue_id: &str) -> Result<Vec<bd_core::Comment>>;
+
+    /// Comments on each of `ids`, in one query. Ids with no comments are absent
+    /// from the result. This is what makes `bd export` one query rather than one
+    /// per issue.
+    async fn comments_of_many(&self, ids: &[String])
+    -> Result<Vec<(String, Vec<bd_core::Comment>)>>;
+
     async fn list_events(&self, issue_id: &str) -> Result<Vec<Event>>;
 
     // --- work queries ---

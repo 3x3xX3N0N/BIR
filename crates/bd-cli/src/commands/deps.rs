@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Result;
-use bd_core::{Dependency, Issue, IssueFilter, Status};
+use bd_core::{Dependency, DependencyType, Issue, IssueFilter, Status};
 use serde_json::json;
 
 use crate::cli::{DepCmd, GraphCmd};
@@ -29,25 +29,58 @@ pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
             }
             Ok(())
         }
-        DepCmd::Remove { issue, depends_on } => {
-            ctx.ensure_writable("remove a dependency")?;
-            let store = ctx.store().await?;
-            store.remove_dependency(&issue, &depends_on).await?;
-            if ctx.out.is_json() {
-                ctx.out
-                    .json_value(&json!({ "issue_id": issue, "depends_on_id": depends_on, "removed": true }))?;
-            } else {
-                ctx.out
-                    .line(format!("{issue} no longer depends on {depends_on}"));
-            }
-            Ok(())
-        }
+        DepCmd::Remove {
+            issue,
+            depends_on,
+            dep_type,
+        } => remove(ctx, &issue, &depends_on, &dep_type).await,
         DepCmd::List { id } => list(ctx, &id).await,
         DepCmd::Tree { id, depth } => tree(ctx, &id, depth).await,
         DepCmd::Cycles => cycles(ctx).await,
-        DepCmd::Relate { .. } => stub("dep relate", ctx),
-        DepCmd::Unrelate { .. } => stub("dep unrelate", ctx),
+        // `related` is an association: it records that two beads have something
+        // to do with each other and gates nothing. `DependencyType::Related`
+        // is the authority on that, not this line.
+        DepCmd::Relate { from, to } => {
+            ctx.ensure_writable("relate two issues")?;
+            let store = ctx.store().await?;
+            let mut d = Dependency::new(&from, &to, DependencyType::Related)?;
+            d.created_by = ctx.identity.actor.clone();
+            store.add_dependency(&d).await?;
+            if ctx.out.is_json() {
+                ctx.out.json_value(&d)?;
+            } else {
+                ctx.out.line(format!("{from} is related to {to}"));
+            }
+            Ok(())
+        }
+        // Writable only since `remove_dependency` learned to take an edge type.
+        // Before that this could not have been written honestly: dropping "the
+        // relation" between two beads would have dropped every other edge
+        // between them too, including whatever was blocking one on the other.
+        DepCmd::Unrelate { from, to } => {
+            remove(ctx, &from, &to, &DependencyType::Related).await
+        }
     }
+}
+
+async fn remove(ctx: &Ctx, issue: &str, depends_on: &str, dep_type: &DependencyType) -> Result<()> {
+    ctx.ensure_writable("remove a dependency")?;
+    let store = ctx.store().await?;
+    store.remove_dependency(issue, depends_on, dep_type).await?;
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&json!({
+            "issue_id": issue,
+            "depends_on_id": depends_on,
+            "type": dep_type.as_str(),
+            "removed": true,
+        }))?;
+    } else {
+        ctx.out.line(format!(
+            "{issue} no longer depends on {depends_on} [{dep_type}]"
+        ));
+    }
+    Ok(())
 }
 
 async fn list(ctx: &Ctx, id: &str) -> Result<()> {
@@ -251,14 +284,12 @@ async fn load(ctx: &Ctx) -> Result<Graph> {
     let mut issues = store.list_issues(&IssueFilter::new()).await?;
     issues.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // N+1 by necessity: the seam has no "every edge" query and rendering needs
-    // every edge. Each call is an index seek on `dependencies(issue_id, type)`.
-    // The consequence to remember is that an edge whose *source* does not exist
-    // is invisible to this loader — see `check`.
-    let mut edges = Vec::new();
-    for i in &issues {
-        edges.extend(store.dependencies_of(&i.id).await?);
-    }
+    // The whole edge table, in one query — including any edge whose *source* has
+    // gone missing. That last part is not incidental: a loader that discovers
+    // edges by walking the issues that exist can only ever find the half of a
+    // corrupt graph that is still attached to something, and finding the other
+    // half is what `check` is for.
+    let edges = store.list_dependencies(&IssueFilter::new()).await?;
 
     let blocked = store
         .blocked_work(&IssueFilter::blocked())
@@ -501,14 +532,16 @@ fn analyze<'a>(g: &'a Graph, cycles: Vec<Vec<String>>) -> Findings<'a> {
             .iter()
             .filter(|d| d.issue_id == d.depends_on_id)
             .collect(),
-        // Only a dangling *target* is detectable. `load` finds edges by walking
-        // out of issues that exist, so an edge whose *source* has vanished is not
-        // in `g.edges` at all — catching those needs an "every edge" seam method
-        // that does not exist yet.
+        // Both ends. `load` now reads the edge table itself rather than walking
+        // out of the issues that exist, so an edge whose *source* has vanished is
+        // finally visible here — and it is exactly as broken as one whose target
+        // has.
         dangling: g
             .edges
             .iter()
-            .filter(|d| !ids.contains(d.depends_on_id.as_str()))
+            .filter(|d| {
+                !ids.contains(d.issue_id.as_str()) || !ids.contains(d.depends_on_id.as_str())
+            })
             .collect(),
         by_type,
     }
@@ -649,6 +682,24 @@ mod tests {
         assert!(!f.ok());
         assert_eq!(f.dangling.len(), 1);
         assert_eq!(f.dangling[0].depends_on_id, "bd-gone");
+    }
+
+    /// An edge whose *source* has vanished is exactly as broken, and used to be
+    /// invisible: the loader found edges by walking out of the issues that
+    /// existed, so an edge from a bead that no longer exists was never in the
+    /// graph to be checked. `list_dependencies` reads the edge table itself, and
+    /// this is the finding that only becomes possible because of it.
+    #[test]
+    fn an_edge_from_a_bead_that_does_not_exist_is_found_too() {
+        let g = Graph {
+            issues: vec![issue("bd-a", "A")],
+            edges: vec![raw_edge("bd-gone", "bd-a")],
+            blocked: HashSet::new(),
+        };
+        let f = analyze(&g, Vec::new());
+        assert!(!f.ok(), "an edge out of a bead that does not exist is dangling");
+        assert_eq!(f.dangling.len(), 1);
+        assert_eq!(f.dangling[0].issue_id, "bd-gone");
     }
 
     /// A cycle is the store's finding, not ours — but it still has to sink the

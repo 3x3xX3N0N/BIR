@@ -115,6 +115,77 @@ fn core_flags_are_where_scripts_expect_them() {
     }
 }
 
+/// Duration arguments are parsed by clap, not by the handler.
+///
+/// The difference is where the failure lands. A bad duration that reaches the
+/// handler opens the workspace, opens the database, and *then* exits 1 with a
+/// bare message — indistinguishable from beads genuinely failing. Parsed by clap
+/// it is a usage error, printed with the flag's own help, before anything is
+/// touched.
+#[test]
+fn duration_flags_are_a_usage_error_when_they_are_typos() {
+    for argv in [
+        vec!["bd", "stale", "--older-than", "a fortnight"],
+        vec!["bd", "purge", "--older-than", "a fortnight"],
+        vec!["bd", "update", "x-1", "--claim", "--lease", "a while"],
+    ] {
+        let err = bd_cli_command()
+            .try_get_matches_from(&argv)
+            .expect_err(&format!("{argv:?} must not parse"));
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{argv:?} must fail in clap, not at runtime: {err}"
+        );
+    }
+
+    // And the good ones still parse, or this test would pass on a broken parser.
+    for argv in [
+        vec!["bd", "stale", "--older-than", "30d"],
+        vec!["bd", "purge", "--older-than", "1w"],
+    ] {
+        bd_cli_command()
+            .try_get_matches_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"));
+    }
+}
+
+/// Commands whose handlers exist and were simply unreachable from the command
+/// tree. Each of these used to be a parse error.
+#[test]
+fn the_commands_that_could_not_be_typed_can_now_be_typed() {
+    for argv in [
+        vec!["bd", "setup", "claude"],
+        vec!["bd", "ship", "parser"],
+        vec!["bd", "ship", "parser", "--force", "--dry-run"],
+        vec!["bd", "gc", "--dry-run"],
+        vec!["bd", "prune", "--dry-run"],
+        vec!["bd", "purge", "--dry-run", "--yes"],
+        vec!["bd", "dep", "remove", "x-1", "x-2", "--type", "related"],
+    ] {
+        bd_cli_command()
+            .try_get_matches_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
+    }
+
+    // `bd link` is for edges that do not gate work, and clap is where that is
+    // enforced — a flag the handler would reject anyway should never have
+    // parsed, tab-completed, or appeared in --help as usable.
+    let err = bd_cli_command()
+        .try_get_matches_from(["bd", "link", "x-1", "x-2", "--type", "blocks"])
+        .expect_err("`bd link --type blocks` must not parse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+
+    // Variadic text arguments are required, all of them: `bd audit record` with
+    // nothing to record is a usage error, not an empty audit entry.
+    assert!(
+        bd_cli_command()
+            .try_get_matches_from(["bd", "audit", "record"])
+            .is_err(),
+        "`bd audit record` with no text must be a usage error"
+    );
+}
+
 #[test]
 fn global_flags_reach_subcommands() {
     let m = bd_cli_command()

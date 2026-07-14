@@ -277,10 +277,13 @@ pub enum Commands {
         with: String,
     },
     /// Link two issues with a non-blocking edge
+    ///
+    /// The gating types (blocks, parent-child, conditional-blocks, waits-for) are
+    /// refused here: they have `bd dep add`.
     Link {
         from: String,
         to: String,
-        #[arg(long = "type", value_name = "TYPE")]
+        #[arg(long = "type", value_name = "TYPE", value_parser = parse::link_type)]
         link_type: Option<DependencyType>,
     },
     /// Keep a claim alive
@@ -331,8 +334,8 @@ pub enum Commands {
     Info,
     /// Issues nobody has touched in a while
     Stale {
-        #[arg(long, default_value = "14d", value_name = "DUR")]
-        older_than: String,
+        #[arg(long, default_value = "14d", value_name = "DUR", value_parser = parse::duration)]
+        older_than: Duration,
     },
     /// Issues with no edges
     Orphans,
@@ -439,16 +442,34 @@ pub enum Commands {
     },
     /// Messages between agents
     Mail { id: Option<String> },
-    /// Ship the current work
-    Ship,
+    /// Publish a capability, so other projects can depend on it
+    ///
+    /// Finds the issue labelled `export:<capability>` and, once it is closed,
+    /// labels it `provides:<capability>`.
+    Ship {
+        /// The capability to publish
+        capability: String,
+        /// Ship it even though the work is not closed
+        #[arg(long)]
+        force: bool,
+        /// Report what would happen, write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     // ===================== Setup =====================
     /// Create a workspace
     Init(InitArgs),
     /// Set up beads in an existing repo
     Bootstrap,
-    /// Interactive setup
-    Setup,
+    /// Write the beads section into your agent's instructions file
+    ///
+    /// Names a harness (claude, codex, factory, cursor, agents) or, given none,
+    /// detects the ones this repo already uses.
+    Setup {
+        #[arg(value_name = "RECIPE")]
+        recipe: Vec<String>,
+    },
     /// Onboard an agent into this workspace
     Onboard,
     /// The 60-second tour
@@ -489,14 +510,29 @@ pub enum Commands {
     /// Check that everything needed is present
     Preflight,
     /// Collect garbage (expired wisps, lapsed leases)
-    Gc,
+    Gc {
+        /// Report what would be collected, write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Delete closed issues permanently
     Purge {
-        #[arg(long, default_value = "90d", value_name = "DUR")]
-        older_than: String,
+        #[arg(long, default_value = "90d", value_name = "DUR", value_parser = parse::duration)]
+        older_than: Duration,
+        /// Report what would be deleted, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Consent, in writing. Required when nobody can answer the prompt —
+        /// which is every script, hook and agent.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Prune ephemeral beads
-    Prune,
+    Prune {
+        /// Report what would be pruned, write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Compact the database
     Compact,
     /// Backups
@@ -594,7 +630,7 @@ impl Commands {
         match self {
             // Run before, or without, a workspace.
             Init(_) | Version | Completion { .. } | Quickstart | Doctor | Preflight | Onboard
-            | Setup | Bootstrap => Need::Nothing,
+            | Setup { .. } | Bootstrap => Need::Nothing,
 
             _ => Need::Workspace,
         }
@@ -772,7 +808,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub offset: Option<u32>,
     /// How to order the results
-    #[arg(long, value_name = "hybrid|priority|oldest")]
+    #[arg(long, value_name = "hybrid|priority|oldest|updated|closed")]
     pub sort: Option<SortPolicy>,
 }
 
@@ -917,9 +953,17 @@ pub enum CommentsCmd {
 pub enum DepCmd {
     /// Add an edge
     Add(DepAddArgs),
-    /// Remove an edge
+    /// Remove one edge
+    ///
+    /// The type matters: two issues may be joined by several edges at once, and
+    /// only the one named here is removed.
     #[command(visible_alias = "rm")]
-    Remove { issue: String, depends_on: String },
+    Remove {
+        issue: String,
+        depends_on: String,
+        #[arg(long = "type", default_value = "blocks", value_name = "TYPE")]
+        dep_type: DependencyType,
+    },
     /// The edges into and out of an issue
     List { id: String },
     /// What an issue is waiting on, as a tree
@@ -961,7 +1005,10 @@ pub enum KvCmd {
 #[derive(Subcommand, Debug)]
 pub enum AuditCmd {
     /// Record an audit entry
-    Record { text: Vec<String> },
+    Record {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
     /// Label an audit entry
     Label { entry: String, label: String },
 }

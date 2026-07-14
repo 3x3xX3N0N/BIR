@@ -185,6 +185,84 @@ fn removing_the_edge_frees_the_bead_it_was_gating() {
     assert_cache_is_already_at_the_fixpoint(&ws, "after removing the edge");
 }
 
+/// **Data loss, through the front door.**
+///
+/// Two beads can be joined by several edges at once. `bd dep remove A B` used to
+/// take a pair and delete every edge between them, so removing a blocker also
+/// destroyed the `related` edge somebody recorded a month ago — silently, while
+/// reporting success. The type is what makes the removal name one edge.
+#[test]
+fn dep_remove_takes_the_edge_you_named_and_not_the_others() {
+    let ws = Ws::new("edgetype");
+    let a = ws.q("The blocker");
+    let b = ws.q("The gated one");
+
+    ws.dep(&b, &a, "blocks");
+    ws.dep(&b, &a, "related");
+
+    ws.ok(&["dep", "remove", &b, &a, "--type", "blocks"]);
+
+    let types: Vec<String> = ws.json(&["dep", "list", &b])["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["related"],
+        "removing the `blocks` edge also destroyed the `related` one"
+    );
+    // The gate really did lift: this is not passing because nothing was removed.
+    assert_eq!(ws.ready(), sorted(&[&a, &b]));
+
+    // Removing an edge that is not there is a failure, not a shrug — otherwise a
+    // typo'd type reports that it removed something and removes nothing.
+    let (_, stderr, code) = ws.run(&["dep", "remove", &b, &a, "--type", "blocks"]);
+    assert_eq!(code, 1, "removing an absent edge must not report success");
+    assert!(!stderr.is_empty());
+}
+
+/// `bd dep relate` / `bd dep unrelate`: an association, and its removal.
+///
+/// `unrelate` could not be written honestly until `remove_dependency` took an
+/// edge type — "drop the relation between these two" would have dropped whatever
+/// else joined them, including the edge blocking one on the other.
+#[test]
+fn relate_records_an_association_and_unrelate_removes_only_that() {
+    let ws = Ws::new("relate");
+    let a = ws.q("The blocker");
+    let b = ws.q("The gated one");
+
+    ws.dep(&b, &a, "blocks");
+    ws.ok(&["dep", "relate", &b, &a]);
+    assert_eq!(
+        ws.blocked(),
+        sorted(&[&b]),
+        "an association must not change what gates what"
+    );
+
+    ws.ok(&["dep", "unrelate", &b, &a]);
+
+    let types: Vec<String> = ws.json(&["dep", "list", &b])["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["blocks"],
+        "unrelate took the blocking edge with it: {types:?}"
+    );
+    assert_eq!(
+        ws.blocked(),
+        sorted(&[&b]),
+        "B is still gated by A — unrelate must not have freed it"
+    );
+    assert_cache_is_already_at_the_fixpoint(&ws, "after unrelate");
+}
+
 // ---------------------------------------------------------------------------
 // The dangerous one: transitive parent-child propagation
 // ---------------------------------------------------------------------------

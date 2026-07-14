@@ -157,6 +157,27 @@ pub fn push_filter(qb: &mut QueryBuilder<'_, Sqlite>, f: &IssueFilter) {
     if let Some(b) = f.is_blocked {
         qb.push(" AND is_blocked = ").push_bind(b);
     }
+    if let Some(b) = f.lease_active {
+        push_lease(qb, b);
+    }
+}
+
+/// Whether the issue is under a lease that has **not** yet expired.
+///
+/// The clock is bound from Rust, never `datetime('now')`: the timestamps in this
+/// schema are RFC-3339 with an explicit offset, and SQLite's own `now` is not.
+/// Comparing the two silently compares strings that do not share a format.
+fn push_lease(qb: &mut QueryBuilder<'_, Sqlite>, active: bool) {
+    if active {
+        qb.push(" AND lease_expires_at IS NOT NULL AND lease_expires_at > ")
+            .push_bind(Utc::now());
+    } else {
+        // A lapsed lease is not a claim. This is the term that makes leases
+        // self-healing: the moment it expires, the work is back on offer.
+        qb.push(" AND (lease_expires_at IS NULL OR lease_expires_at <= ")
+            .push_bind(Utc::now())
+            .push(")");
+    }
 }
 
 /// The ready-work predicates, which no caller-supplied filter may relax.
@@ -182,6 +203,21 @@ pub fn push_ready_predicates(qb: &mut QueryBuilder<'_, Sqlite>, blocked: bool) {
         qb.push(" AND (defer_until IS NULL OR defer_until <= ")
             .push_bind(Utc::now())
             .push(")");
+
+        // Nor is a *held* bead. An issue somebody claimed five minutes ago is
+        // not claimable — `claim_issue` will fence a second agent out of it — so
+        // offering it in `bd ready` only means one of the two agents finds out by
+        // failing, after it has read the issue and started thinking.
+        //
+        // Applied here rather than left to `IssueFilter::ready()` alone because
+        // `count_work` (and therefore `bd status`, `bd info`, `bd prime`) counts
+        // ready work without any filter at all. A count that disagreed with the
+        // list would be its own bug.
+        //
+        // Explicitly *not* applied to the blocked side: a claimed issue that a
+        // new edge has since gated is still something `bd blocked` must show,
+        // and hiding it would leave the gate invisible to everyone.
+        push_lease(qb, false);
     }
 }
 
@@ -206,6 +242,17 @@ pub fn push_order_and_limit(qb: &mut QueryBuilder<'_, Sqlite>, f: &IssueFilter) 
         }
         SortPolicy::Oldest => {
             qb.push(" ORDER BY created_at ASC, id ASC");
+        }
+        // Ascending: `bd stale` asks "what has nobody touched", and the answer
+        // leads with what nobody has touched for longest.
+        SortPolicy::Updated => {
+            qb.push(" ORDER BY updated_at ASC, id ASC");
+        }
+        // Descending, and pointing the other way on purpose — the question is
+        // "what did we just finish". SQLite sorts NULLs last under DESC, so open
+        // issues (which have no close time) fall to the end rather than the top.
+        SortPolicy::Closed => {
+            qb.push(" ORDER BY closed_at DESC, id ASC");
         }
     }
 

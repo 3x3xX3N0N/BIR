@@ -109,15 +109,30 @@ CREATE TABLE IF NOT EXISTS labels (
 
 CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
 
+-- Comment ids are UUIDs, and the reason is `bd import`.
+--
+-- `upsert_comment` keys on the incoming id, which is what makes re-importing a
+-- file a no-op instead of a way to duplicate every comment. That only works if
+-- an id means the same comment *everywhere*. A workspace-local AUTOINCREMENT
+-- does not: two workspaces that have each ever written a comment both hold a
+-- comment 1, so importing A's export into B overwrites B's comment with A's
+-- text and re-parents it onto A's issue. No error, no conflict — B's comment is
+-- simply gone.
+--
+-- Ids are therefore minted globally unique on insert. Not `bd_core::idgen`:
+-- that mints *short readable* ids to be typed at a terminal, and nobody ever
+-- types a comment id.
 CREATE TABLE IF NOT EXISTS comments (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         TEXT PRIMARY KEY,
     issue_id   TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
     author     TEXT NOT NULL DEFAULT '',
     text       TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id, id);
+-- Ordering is by time, not by id: a UUID sorts randomly, so an index (and an
+-- ORDER BY) on the id would hand back a thread of comments shuffled.
+CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id, created_at);
 
 -- No foreign key to `issues`, on purpose. The audit trail must outlive the row
 -- it describes: `delete_issue` records a `deleted` event, and an ON DELETE
