@@ -34,7 +34,10 @@ use async_trait::async_trait;
 use bd_core::{Dependency, DependencyType, Event, Issue, IssueFilter};
 use chrono::{DateTime, Utc};
 
-pub use capability::{Conflict, HistoryViewer, RemoteStore, VersionControl};
+pub use capability::{
+    ChangeKind, CommitInfo, Conflict, FieldChange, HistoryViewer, IssueDiff, MergeOutcome,
+    RemoteStore, ResolveStrategy, Revision, VersionControl,
+};
 pub use error::{Error, Result};
 pub use locator::{Backend, Locator};
 pub use stats::Stats;

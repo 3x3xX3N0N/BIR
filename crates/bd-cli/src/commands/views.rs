@@ -184,9 +184,42 @@ pub async fn history(ctx: &Ctx, id: &str) -> Result<()> {
 /// backend without a commit graph has no refs to diff.
 ///
 /// [`HistoryViewer`]: bd_storage::HistoryViewer
-pub async fn diff(ctx: &Ctx, _from: &str, _to: &str) -> Result<()> {
+pub async fn diff(ctx: &Ctx, from: &str, to: &str) -> Result<()> {
     require_cap(ctx, "diff", Cap::History)?;
-    stub("diff", ctx)
+    let store = ctx.store().await?;
+    let history = store
+        .history()
+        .ok_or_else(|| anyhow!("this backend has no commit graph"))?;
+
+    let diffs = history.diff(from, to).await?;
+
+    if ctx.out.is_json() {
+        return ctx.out.json_value(&diffs);
+    }
+    if diffs.is_empty() {
+        ctx.out.line(format!("no issue changes between {from} and {to}"));
+        return Ok(());
+    }
+    for d in &diffs {
+        let mark = match d.change {
+            bd_storage::ChangeKind::Added => "+",
+            bd_storage::ChangeKind::Removed => "-",
+            bd_storage::ChangeKind::Modified => "~",
+        };
+        ctx.out.line(format!("{mark} {}", d.issue_id));
+        // Only a modification has fields to show; an add or a remove is the
+        // whole issue, and dumping every column of it here would bury the ten
+        // lines that changed under a hundred that did not.
+        for f in &d.fields {
+            ctx.out.line(format!(
+                "    {}: {} → {}",
+                f.field,
+                f.from.as_deref().unwrap_or("∅"),
+                f.to.as_deref().unwrap_or("∅")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Where the workspace is, and who beads thinks you are. Needs no database,

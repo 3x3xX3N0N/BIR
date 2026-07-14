@@ -232,16 +232,39 @@ fn fix_does_not_revert_a_prefix_someone_actually_chose() {
 /// reads `config.yaml` first. A user runs it, sees the new value echoed back,
 /// and keeps minting the old prefix. Nothing else in the program will ever tell
 /// them.
+/// The bug this check was written for is now **fixed**: `bd config set` writes
+/// `config.yaml` too, so the setting takes effect and the two halves stay in
+/// step. This asserts the fix, and it would fail loudly if anyone reintroduced
+/// the silent no-op.
 #[test]
-fn a_config_set_that_never_took_effect_is_an_error() {
+fn setting_the_prefix_actually_changes_the_prefix() {
     let ws = Ws::new("authority");
     assert_eq!(ws.run(&["config", "set", "issue.prefix", "widgets"]).1, 0);
+
+    // The thing the user was promised, and used not to get.
+    assert!(
+        ws.create("proof").starts_with("widgets-"),
+        "`bd config set issue.prefix` echoed the new value back and kept minting the old one"
+    );
+    assert_eq!(status(&ws.finding("prefix config")), "ok");
+}
+
+/// ...but the check still has a job. Two halves can still fall out of step —
+/// a hand-edited `config.yaml`, another beads implementation writing only the
+/// store, a botched merge. So make one by hand and prove doctor still catches it.
+#[test]
+fn a_prefix_the_store_and_the_yaml_disagree_about_is_an_error() {
+    // `bd init --prefix acme` puts `acme` in BOTH halves. Now move only one of
+    // them, behind `bd config set`'s back — which is what a hand-edit, a botched
+    // merge, or another beads implementation writing only the store looks like.
+    let ws = Ws::new("authority-drift");
+    ws.write_config("prefix: widgets\nclaim:\n  lease: 1h\n");
 
     let f = ws.finding("prefix config");
     assert_eq!(
         status(&f),
         "error",
-        "silently ignored setting: {}",
+        "the two halves disagree and nobody said so: {}",
         evidence(&f)
     );
     let e = evidence(&f);
@@ -250,13 +273,14 @@ fn a_config_set_that_never_took_effect_is_an_error() {
         "both halves must be named: {e}"
     );
 
-    // Ids keep coming out with config.yaml's prefix — which is the whole point.
-    assert!(ws.create("proof").starts_with("acme-"));
+    // Ids come out with config.yaml's prefix — it is the one bd actually reads,
+    // which is why a store-only write was a silent no-op.
+    assert!(ws.create("proof").starts_with("widgets-"));
 
     // And the repair is not a guess: config.yaml is authoritative, so it wins.
     ws.run(&["doctor", "--fix"]);
     let (stored, _) = ws.run(&["config", "get", "issue.prefix"]);
-    assert_eq!(stored, "acme");
+    assert_eq!(stored, "widgets");
     assert_eq!(status(&ws.finding("prefix config")), "ok");
 }
 

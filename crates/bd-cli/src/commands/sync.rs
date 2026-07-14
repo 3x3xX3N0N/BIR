@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use bd_core::{Comment, Dependency, Issue, IssueFilter, Status};
 use bd_storage::{Field, IssuePatch};
 use serde_json::{Value, json};
@@ -234,9 +234,53 @@ fn patch_from(i: &Issue) -> IssuePatch {
 /// With a name it switches branches, without one it lists them. Either way it
 /// wants a commit graph, so the capability check comes first — on sqlite this
 /// is exit 2 (an honest no), never exit 64.
-pub async fn branch(ctx: &Ctx, _name: Option<String>) -> Result<()> {
+pub async fn branch(ctx: &Ctx, name: Option<String>) -> Result<()> {
     require_cap(ctx, "branch", Cap::VersionControl)?;
-    stub("branch", ctx)
+    let store = ctx.store().await?;
+    // `require_cap` already established this, but it did so from the *locator*,
+    // which is deliberately allowed to answer without opening a database. Now
+    // that one is open, the store is the authority.
+    let vc = store
+        .version_control()
+        .ok_or_else(|| anyhow!("this backend has no commit graph"))?;
+
+    match name {
+        // With a name: switch to it, creating it if it does not exist. That is
+        // what every user means by `bd branch feature-x`, and making them run a
+        // separate create step first is a ceremony git itself abandoned.
+        Some(name) => {
+            ctx.ensure_writable("switch branches")?;
+            let existing = vc.list_branches().await?;
+            let created = !existing.iter().any(|b| *b == name);
+            if created {
+                vc.create_branch(&name).await?;
+            }
+            vc.checkout(&name).await?;
+            if ctx.out.is_json() {
+                ctx.out.json_value(&json!({ "branch": name, "created": created }))?;
+            } else if created {
+                ctx.out.line(format!("created and switched to branch {name}"));
+            } else {
+                ctx.out.line(format!("switched to branch {name}"));
+            }
+        }
+        None => {
+            let current = vc.current_branch().await?;
+            let branches = vc.list_branches().await?;
+            if ctx.out.is_json() {
+                ctx.out.json_value(&json!({
+                    "current": current,
+                    "branches": branches,
+                }))?;
+            } else {
+                for b in &branches {
+                    let mark = if *b == current { "*" } else { " " };
+                    ctx.out.line(format!("{mark} {b}"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn vc(ctx: &Ctx, cmd: VcCmd) -> Result<()> {

@@ -110,21 +110,22 @@ pub struct Revision {
     pub issue: bd_core::Issue,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IssueDiff {
     pub issue_id: String,
     pub change: ChangeKind,
     pub fields: Vec<FieldChange>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChangeKind {
     Added,
     Modified,
     Removed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FieldChange {
     pub field: String,
     pub from: Option<String>,

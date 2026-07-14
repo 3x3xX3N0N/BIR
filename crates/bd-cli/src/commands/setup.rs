@@ -870,6 +870,25 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             ctx.ensure_writable("set a config key")?;
             let store = ctx.store().await?;
             store.set_config(&key, &value).await?;
+
+            // Some keys are *shadowed* by `.beads/config.yaml`, which
+            // `Ctx::prefix` (and friends) consult first. Writing only the store
+            // for one of those is a silent no-op: `bd config set issue.prefix
+            // acme` would echo `issue.prefix = acme` back, and bd would go on
+            // minting `bd-` ids forever. The collision surfaces weeks later, in
+            // someone else's repository, as a merge conflict between two issues
+            // that both minted `bd-a3f2`.
+            //
+            // So write both, and keep them in step. The store copy is what
+            // another beads implementation reads; the yaml is what this one does.
+            if key == "issue.prefix" || key == "prefix" {
+                if let Some(dir) = &ctx.beads_dir {
+                    let mut config = ctx.config.clone();
+                    config.prefix = Some(value.clone());
+                    config.save(dir)?;
+                }
+            }
+
             if ctx.out.is_json() {
                 ctx.out.json_value(&json!({ "key": key, "value": value }))?;
             } else {

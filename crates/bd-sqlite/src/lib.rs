@@ -73,7 +73,20 @@ pub async fn open(locator: &Locator, identity: Identity) -> Result<Box<dyn Stora
     }
     let path = locator.db_path();
     if !path.exists() {
-        return Err(Error::NoWorkspace);
+        // NOT `NoWorkspace`, which renders as "no beads workspace found (run
+        // `bd init`)". There *is* a workspace — we are holding its locator — and
+        // `bd init` would refuse for exactly that reason. This is the fresh-clone
+        // case: `.beads/` is committed, the database is (rightly) not, and the
+        // clone has never imported. It is the most common recoverable failure in
+        // the system, and it used to misidentify itself and hand the user a fix
+        // that could not work.
+        return Err(Error::Db(format!(
+            "the workspace at {} has no database at {}.\n\
+             If this is a fresh clone, the database is not committed (it should not be) — \
+             rebuild it: `bd init --force --prefix <yours>` then `bd import .beads/issues.jsonl`.",
+            locator.dir.display(),
+            path.display()
+        )));
     }
     Ok(Box::new(SqliteStore::new(connect(&path).await?, identity)))
 }
