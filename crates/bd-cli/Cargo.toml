@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "bd_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bd"
 path = "src/main.rs"
@@ -17,6 +21,7 @@ bd-storage = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

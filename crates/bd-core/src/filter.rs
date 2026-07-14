@@ -37,14 +37,43 @@ impl std::str::FromStr for SortPolicy {
 /// Anything expressible here is answered by the database. The query DSL falls
 /// back to an in-memory predicate only for what this cannot express — and even
 /// then it uses a filter to pre-shrink the candidate set first.
+/// # Semantics
+///
+/// Every field is a conjunct: a filter is the AND of its non-empty parts. The
+/// details below are stated here, not in the backend, because `bd-query` decides
+/// whether a query is *fully* answerable in SQL by reasoning about them. A
+/// backend that quietly disagrees turns a pushdown into a wrong answer.
+///
+/// - **String equality is exact**: byte-for-byte, not case-folded.
+/// - **`text` is a case-insensitive substring search** over title/description —
+///   ASCII-insensitive, i.e. whatever SQL `LIKE` does.
+/// - **Date bounds are strict**: `*_after` is `col > t`, `*_before` is
+///   `col < t`. A NULL timestamp satisfies neither.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IssueFilter {
     pub status: Option<Status>,
     /// Match any of these statuses (an OR).
     pub statuses: Vec<Status>,
+    /// Match none of these. `NOT status=closed` and `status!=closed` both land
+    /// here; without it, negation could not be pushed down at all.
+    pub exclude_statuses: Vec<Status>,
     pub priority: Option<Priority>,
+    /// Urgency bounds, inclusive — and note that they are numeric bounds *in
+    /// reverse*, because P0 is the most urgent priority, not the least:
+    ///
+    /// - `min_priority` = "at least this important" = `priority <= n`
+    /// - `max_priority` = "at most this important"  = `priority >= n`
+    ///
+    /// Reading either as a plain numeric min/max silently inverts the filter and
+    /// hands back exactly the issues the user was trying to exclude.
+    ///
+    /// A bound may legitimately fall outside P0-P4: `priority>4` is a query with
+    /// no answers, and encoding it as `priority >= 5` lets the database say so
+    /// without a scan.
     pub min_priority: Option<Priority>,
+    pub max_priority: Option<Priority>,
     pub issue_type: Option<IssueType>,
+    pub exclude_types: Vec<IssueType>,
     pub assignee: Option<String>,
     pub owner: Option<String>,
 
@@ -64,7 +93,7 @@ pub struct IssueFilter {
     pub closed_after: Option<DateTime<Utc>>,
     pub closed_before: Option<DateTime<Utc>>,
 
-    /// Substring match across title/description.
+    /// Case-insensitive substring match across title/description.
     pub text: Option<String>,
 
     pub pinned: Option<bool>,

@@ -9,3 +9,8 @@ license.workspace = true
 bd-core = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Only to build an issue with metadata in the tests; the crate itself reaches
+# metadata through `Issue`, never by naming the JSON type.
+serde_json = { workspace = true }

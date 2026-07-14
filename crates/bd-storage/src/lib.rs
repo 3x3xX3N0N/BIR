@@ -226,23 +226,17 @@ pub trait Storage: Send + Sync {
     }
 }
 
-/// Open an existing workspace.
-///
-/// The backend is read from the locator, never from the environment (rule 3).
-pub async fn open(locator: &Locator, identity: Identity) -> Result<Box<dyn Storage>> {
-    match locator.backend {
-        Backend::Sqlite => Err(Error::Db(
-            "sqlite backend is provided by the bd-sqlite crate; call bd_sqlite::open".into(),
-        )),
-        Backend::Dolt => Err(Error::unsupported_hint(
-            "open",
-            "dolt",
-            "the dolt backend is not implemented yet",
-        )),
-        Backend::Postgres | Backend::Mysql => Err(Error::unsupported_hint(
-            "open",
-            "sql",
-            "this backend is not implemented yet",
-        )),
-    }
-}
+// Note on rule 1 ("construction is on the seam"): there is deliberately no
+// `open()` here.
+//
+// A dispatcher in this crate would have to depend on every backend crate, and
+// each backend already depends on this one — the cycle is not incidental, it is
+// structural. So the dispatch lives one layer *above* the seam instead, in
+// exactly one function in bd-cli. That still satisfies rule 1, which asks that
+// the program have a single place that names concrete backends, not that the
+// place be here.
+//
+// A stub `open()` that matched on `Backend` and returned "not my department"
+// for every arm would look like it honored the rule while being a function that
+// cannot succeed. Rule 1 is about the CLI holding a `Box<dyn Storage>` and never
+// learning what it got, and it does.

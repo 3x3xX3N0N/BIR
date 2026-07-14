@@ -17,9 +17,10 @@ pub const MAX_DEPENDENCY_TYPE_LEN: usize = 50;
 /// separate parallel concept the way upstream does, an unrecognized status is
 /// carried as `Custom` and resolved against the workspace's status config when
 /// its category is needed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(from = "String", into = "String")]
 pub enum Status {
+    #[default]
     Open,
     InProgress,
     Blocked,
@@ -103,12 +104,6 @@ impl std::fmt::Display for Status {
     }
 }
 
-impl Default for Status {
-    fn default() -> Self {
-        Status::Open
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusCategory {
@@ -184,11 +179,12 @@ impl std::str::FromStr for Priority {
 // IssueType
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(from = "String", into = "String")]
 pub enum IssueType {
     Bug,
     Feature,
+    #[default]
     Task,
     Epic,
     Chore,
@@ -280,12 +276,6 @@ impl std::fmt::Display for IssueType {
     }
 }
 
-impl Default for IssueType {
-    fn default() -> Self {
-        IssueType::Task
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Dependency graph
 // ---------------------------------------------------------------------------
@@ -295,11 +285,12 @@ impl Default for IssueType {
 /// Only four of these affect whether work is claimable — see
 /// [`DependencyType::affects_ready_work`]. The rest are associations, links,
 /// or provenance, and exist to be traversed and displayed, not to gate work.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(from = "String", into = "String")]
 pub enum DependencyType {
     // --- workflow: these gate readiness ---
     /// A blocks B: B cannot start until A closes.
+    #[default]
     Blocks,
     /// Structural containment. Propagates blocked-ness down to children.
     ParentChild,
@@ -469,12 +460,6 @@ impl std::str::FromStr for DependencyType {
 impl std::fmt::Display for DependencyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl Default for DependencyType {
-    fn default() -> Self {
-        DependencyType::Blocks
     }
 }
 

@@ -26,6 +26,13 @@ pub enum Error {
     #[error("operator {op} is not valid for field {field}")]
     BadOperator { op: String, field: String },
 
-    #[error("query language not implemented yet")]
-    NotImplemented,
+    #[error("invalid value {value:?} for field {field}: {reason}")]
+    InvalidValue {
+        field: String,
+        value: String,
+        reason: String,
+    },
+
+    #[error("empty query")]
+    EmptyQuery,
 }
