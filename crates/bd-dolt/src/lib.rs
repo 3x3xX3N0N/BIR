@@ -92,18 +92,158 @@ impl DoltStore {
     }
 }
 
-/// Create a Dolt workspace and return an open store.
-pub async fn init(_dir: &Path, _prefix: &str, _identity: Identity) -> Result<Box<dyn Storage>> {
-    Err(not_built("init"))
+/// Create a Dolt workspace in `dir` and return an open store.
+///
+/// `dir` is the `.beads` directory itself — it *is* the dolt repository. Do not
+/// join `.beads` again; the caller already resolved it. (An earlier version of
+/// the sqlite backend did join, and produced `.beads/.beads/beads.db`.)
+pub async fn init(dir: &Path, prefix: &str, identity: Identity) -> Result<Box<dyn Storage>> {
+    let dolt = require_dolt_binary()?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| other(format!("cannot create {}: {e}", dir.display())))?;
+
+    // Identity first, and note the ordering is not incidental: `dolt init`
+    // refuses to run without a `user.name`/`user.email`, and `dolt config
+    // --local` has nowhere to write until `.dolt/` exists. `ensure_identity`
+    // handles exactly that: `--global` before the repo, `--local` after.
+    server::ensure_identity(dir).await?;
+
+    if !dir.join(".dolt").is_dir() {
+        run_dolt(&dolt, dir, &["init"]).await?;
+    }
+
+    let store = open_at(dir, identity).await?;
+    store.set_config(PREFIX_KEY, prefix).await?;
+    Ok(Box::new(store))
 }
 
 /// Open an existing Dolt workspace.
-pub async fn open(_locator: &Locator, _identity: Identity) -> Result<Box<dyn Storage>> {
-    Err(not_built("open"))
+///
+/// The backend comes from the locator (seam rule 3) — by the time we are here,
+/// the workspace on disk has already said it is a Dolt one.
+pub async fn open(locator: &Locator, identity: Identity) -> Result<Box<dyn Storage>> {
+    require_dolt_binary()?;
+    let dir = locator.dir.as_path();
+    if !dir.join(".dolt").is_dir() {
+        return Err(other(format!(
+            "{} says this workspace is a dolt workspace, but there is no .dolt/ \
+             directory in {}. The database is missing, not merely closed.",
+            bd_storage::locator::LOCATOR_FILE,
+            dir.display()
+        )));
+    }
+    server::ensure_identity(dir).await?;
+    Ok(Box::new(open_at(dir, identity).await?))
 }
 
-fn not_built(op: &'static str) -> Error {
-    Error::unsupported_hint(op, "dolt", "the dolt backend is not implemented yet")
+/// Start (or adopt) the server, find the database, apply the schema.
+async fn open_at(dir: &Path, identity: Identity) -> Result<DoltStore> {
+    let server = server::DoltServer::start(dir).await?;
+    let db = discover_database(&server).await?;
+    let pool = store::connect_pool(&server.dsn(&db)).await?;
+    store::apply_schema(&pool).await?;
+    Ok(DoltStore::new(pool, identity, Some(server), dir))
+}
+
+/// Ask the server what the database is called, rather than deriving it.
+///
+/// Dolt names a database after the directory holding it, mangling any character
+/// that is not legal in a SQL identifier. Our directory is `.beads` — it starts
+/// with a dot, which is exactly the sort of thing that gets mangled, and the
+/// mangling rule is an implementation detail of a Go program we cannot run here.
+///
+/// So: do not guess. A wrong guess would fail at *connect* time with "unknown
+/// database", on a machine we have no way to test on. `SHOW DATABASES` costs one
+/// round trip and is right by construction.
+async fn discover_database(server: &server::DoltServer) -> Result<String> {
+    // No database in the DSN — we are asking *which* database.
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.dsn(""))
+        .await
+        .map_err(|e| other(format!("cannot reach the dolt server on port {}: {e}", server.port())))?;
+    let all: Vec<String> = sqlx::query_scalar("SHOW DATABASES")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| other(format!("SHOW DATABASES failed: {e}")))?;
+    pool.close().await;
+
+    let mut user: Vec<String> = all
+        .into_iter()
+        .filter(|d| !is_system_database(d))
+        .collect();
+
+    match user.len() {
+        1 => Ok(user.pop().expect("length checked")),
+        0 => Err(other(format!(
+            "the dolt server in {} is serving no database. `dolt init` may not have run.",
+            server.dir().display()
+        ))),
+        // An adopted server (a shared `dolt sql-server`, DoltLab) can serve
+        // several. Guessing which one holds the issues is worse than saying so.
+        _ => Err(other(format!(
+            "the dolt server on port {} serves several databases and beads cannot tell \
+             which is this workspace's: {}. Point beads at a server that serves only \
+             this one.",
+            server.port(),
+            user.join(", ")
+        ))),
+    }
+}
+
+/// Dolt serves the MySQL system schemas plus a couple of its own.
+fn is_system_database(name: &str) -> bool {
+    const SYSTEM: &[&str] = &[
+        "information_schema",
+        "mysql",
+        "performance_schema",
+        "sys",
+        // Dolt's own: the cluster-control schema, and the always-present
+        // scratch database a server with no repo falls back on.
+        "dolt_cluster",
+    ];
+    let lower = name.to_ascii_lowercase();
+    SYSTEM.contains(&lower.as_str())
+}
+
+/// A missing `dolt` is a real, fixable failure — **not** a capability gap.
+///
+/// Exit 2 (`Unsupported`) means "this backend cannot do that, final answer, stop
+/// asking". A Dolt backend on a machine with no `dolt` binary is not that: the
+/// backend is perfectly capable and the machine is one download short. Saying
+/// exit 2 here would tell the user to give up on something that `winget install
+/// dolt` fixes.
+fn require_dolt_binary() -> Result<PathBuf> {
+    which_dolt().ok_or_else(|| {
+        other(
+            "this is a dolt workspace, but there is no `dolt` binary on PATH.\n\
+             Install it from https://github.com/dolthub/dolt (or `brew install dolt`, \
+             `winget install DoltHub.Dolt`) and try again.",
+        )
+    })
+}
+
+async fn run_dolt(dolt: &Path, dir: &Path, args: &[&str]) -> Result<()> {
+    let out = tokio::process::Command::new(dolt)
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| other(format!("cannot run `dolt {}`: {e}", args.join(" "))))?;
+    if !out.status.success() {
+        return Err(other(format!(
+            "`dolt {}` failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn other(msg: impl Into<String>) -> Error {
+    Error::Other(bd_storage::error::anyhow_lite::Error(msg.into()))
 }
 
 /// Whether a `dolt` binary is on PATH.
