@@ -1,47 +1,77 @@
 //! Dolt Storage — only meaningful when the workspace's backend *is* Dolt.
 //!
 //! Read the backend from the locator (`dx.ctx.backend()`), never from a flag or
-//! the environment. On a SQLite workspace every check here must return
-//! [`Finding::ok`] with "not a dolt workspace" — **not** a warning. A user who
-//! chose SQLite has no problem, and telling them ten times that they have no
-//! Dolt server is noise that trains people to ignore doctor.
+//! the environment. On a SQLite workspace every check here returns
+//! [`Finding::na`] — not `Ok`, and emphatically not a warning. A user who chose
+//! SQLite has no Dolt problem; telling them so ten times is how you teach people
+//! to ignore `bd doctor`, and calling it `ok` would inflate the count of things
+//! that were *verified* with things that were *skipped*.
 //!
-//! The one that actually saves people: **a stale `dolt sql-server` still holding
-//! the database lock.** The next `bd` invocation then fails with an error that
-//! reads exactly like database corruption, and users reach for `rm -rf`.
+//! # `.beads/` **is** the dolt repository
 //!
-//! Belongs here: server reachable, schema present, working-set status, stale
-//! locks and orphaned server processes, storage format, remote/origin agreement
-//! with git, server-vs-embedded mode mismatch, issue count sanity, performance.
+//! This is the fact everything here turns on, and getting it wrong is not a
+//! cosmetic error. An earlier version of this file was written by an agent who
+//! could not read [`bd_dolt`] and guessed the layout: it looked for the database
+//! in `.beads/dolt/.dolt/`, for a bare-number pid in `.beads/dolt-server.pid`,
+//! and for a port in `.beads/dolt-server.port`. None of those paths exist. Every
+//! check inspected nothing and reported a clean bill of health for a workspace it
+//! had never looked at — the exact "reports as coverage" failure this whole
+//! design is built against, and worse than having no checks at all.
+//!
+//! So: **no path, filename or record layout is spelled out in this file.** They
+//! come from `bd-dolt`, which owns them:
+//!
+//! * [`bd_dolt::server::pidfile_path`] / [`bd_dolt::server::PID_FILE`] — the
+//!   server record, `.beads/dolt-server.json`, holding `{pid, port}` **together**.
+//! * [`bd_dolt::server::read_pidfile`] — the only thing that parses it.
+//! * [`bd_dolt::server::LOG_FILE`], [`bd_dolt::server::PORT_ENV`].
+//! * [`bd_dolt::which_dolt`] — the same PATH resolution the store itself uses, so
+//!   doctor cannot claim to have found a `dolt` that `bd` will then fail to find.
+//!
+//! The only Dolt-owned paths named here are `.dolt/`, its `noms/manifest` and its
+//! `repo_state.json`, which are Dolt's published on-disk format rather than
+//! bd's bookkeeping.
+//!
+//! # The one that actually saves people
+//!
+//! **A stale or wedged `dolt sql-server` still holding the database lock.** The
+//! next `bd` invocation fails with an error that reads exactly like database
+//! corruption, and users reach for `rm -rf`. Since `.beads/` *is* the repository,
+//! that `rm -rf` destroys the issues, the history and the database in one stroke.
 //!
 //! # What this family may touch, and what it may not
 //!
-//! `bd-cli` does not depend on `bd-dolt`, and it has no MySQL client. So every
-//! check here works from three things and nothing else: the backend on the
-//! locator, the filesystem, and a `dolt` binary if the user has one. That rules
-//! out the whole server-query half of upstream's Dolt suite (schema tables,
-//! `dolt_status`, issue counts, phantom databases). Those are *not* stubbed out
-//! as passing — they are simply not here, which is the honest form of "nobody
-//! has written that yet".
-//!
-//! Two lines that are load-bearing, not stylistic:
+//! Three lines that are load-bearing, not stylistic:
 //!
 //! * **Nothing in this file ever writes inside `.dolt/`.** Not the noms `LOCK`,
-//!   not the manifest, not a journal. Those are Dolt's, they are advisory or
-//!   content-addressed, and removing one turns a recoverable workspace into an
-//!   unrecoverable one. Repair here is confined to *bd's own* bookkeeping in
-//!   `.beads/`: the pid file, the port file, and bd's lock files.
+//!   not the manifest, not a journal. Those are Dolt's; the `LOCK` is *advisory*
+//!   (the OS drops it when the holder dies, so its presence proves nothing) and
+//!   removing it — or the manifest — turns a recoverable workspace into an
+//!   unrecoverable one. Repair here is confined to *bd's own* bookkeeping at the
+//!   top level of `.beads/`: the server record and bd's lock files.
 //! * **A live pid is not proof of a live server.** Windows recycles process ids
-//!   aggressively, so "a process with id 4812 exists" is much weaker evidence
-//!   than it looks — 4812 may now be a text editor. Staleness is therefore
-//!   decided on the *identity* of the process (is it a `dolt`?) and, where a
-//!   port is known, on whether anything is actually listening.
+//!   aggressively, so "a process with id 4812 exists" is much weaker evidence than
+//!   it looks — 4812 may now be a text editor. Staleness is decided on the
+//!   *identity* of the process (is it a `dolt`?) and on whether the recorded port
+//!   is actually **serving**.
+//! * **"Serving" means the server spoke, not merely that it accepted.** Dolt binds
+//!   its listener slightly before it can answer, and a wedged server accepts and
+//!   then resets. A connect-only probe reports that server as healthy — which is
+//!   precisely the server this family exists to catch. See [`is_serving`].
+//!
+//! # Not here
+//!
+//! Everything that needs to *query* the server — schema tables, `dolt_status`,
+//! issue counts, phantom databases — is absent, not stubbed as passing. `bd-cli`
+//! has no MySQL client of its own, and opening the store to get one would mean
+//! `bd doctor` could not run on the broken workspaces that are its entire job.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use bd_dolt::server::{LOG_FILE, PID_FILE, PORT_ENV, PidFile, pidfile_path, read_pidfile};
 use bd_storage::Backend;
 
 use super::super::{Category, Check, Dx, Finding, Repair};
@@ -52,40 +82,47 @@ pub fn checks() -> Vec<Box<dyn Check>> {
         Box::new(DoltDatabase),
         Box::new(StorageFormat),
         Box::new(Server),
-        Box::new(LockFiles),
         Box::new(RemoteVsOrigin),
     ]
 }
 
 /// The single sentence a non-Dolt workspace ever hears from this family.
 ///
-/// Every check says exactly this and says it as `Ok`, so the human renderer
-/// collapses the whole family to one green line (see `print_human`: a category
-/// in which everything is `Ok` gets a single row, never a wall of green).
+/// Every check says exactly this and says it as [`Finding::na`], so the human
+/// renderer collapses the whole family to one quiet grey line.
 const NOT_DOLT: &str = "not a dolt workspace";
 
 // ---------------------------------------------------------------------------
-// Where things are
+// Where things are — and every one of these comes from bd-dolt
 // ---------------------------------------------------------------------------
 
 /// The Dolt-relevant paths of a workspace that *is* Dolt-backed.
 ///
 /// Constructed only through [`dolt_ws`], which is the one place the backend is
-/// read. Holding one of these is proof the backend came from the locator on
-/// disk and not from a flag.
+/// read. Holding one of these is proof the backend came from the locator on disk
+/// and not from a flag.
 struct DoltWs {
+    /// The `.beads` directory — which **is** the dolt repository. There is no
+    /// `.beads/dolt/`; do not add one.
     beads: PathBuf,
 }
 
 impl DoltWs {
-    /// `.beads/dolt` — the Dolt data directory.
-    fn dolt(&self) -> PathBuf {
-        self.beads.join("dolt")
+    /// `.beads/.dolt` — Dolt's own metadata. **Never written to here.**
+    fn dot_dolt(&self) -> PathBuf {
+        self.beads.join(".dolt")
     }
 
-    /// `.beads/dolt/.dolt` — Dolt's own metadata. **Never written to here.**
-    fn dot_dolt(&self) -> PathBuf {
-        self.dolt().join(".dolt")
+    /// `.beads/dolt/.dolt` — where **upstream Go beads** keeps the database, and
+    /// the *only* reason this path is named in this file.
+    ///
+    /// It is not a path we read, write, or repair. It exists so that a workspace
+    /// created by the Go implementation gets told what is actually wrong with it
+    /// instead of "your database is missing" — and, not incidentally, as a
+    /// tombstone: this is the layout the previous version of this file inspected
+    /// for *everything*, which is why it inspected nothing.
+    fn upstream_dot_dolt(&self) -> PathBuf {
+        self.beads.join("dolt").join(".dolt")
     }
 
     /// The noms manifest. Its second field is the storage format.
@@ -97,23 +134,23 @@ impl DoltWs {
         self.dot_dolt().join("repo_state.json")
     }
 
+    /// `.beads/dolt-server.json`. From `bd-dolt`, never spelled out here: a
+    /// second copy of this filename is the bug that produced this file's rewrite.
     fn pid_file(&self) -> PathBuf {
-        self.beads.join(PID_FILE)
+        pidfile_path(&self.beads)
     }
 
-    fn port_file(&self) -> PathBuf {
-        self.beads.join(PORT_FILE)
+    /// Where the server's stdout and stderr went. The first place to look when a
+    /// server is wedged, and useless if we cannot name it.
+    fn log_file(&self) -> PathBuf {
+        self.beads.join(LOG_FILE)
     }
 }
 
-const PID_FILE: &str = "dolt-server.pid";
-const PORT_FILE: &str = "dolt-server.port";
-
 /// The gate. `None` means "this check has nothing to say here".
 ///
-/// Note the shape: the backend comes from `ctx.backend()`, which reads the
-/// locator that `bd init` wrote. A `--backend` flag could not reach this code
-/// if it tried.
+/// The backend comes from `ctx.backend()`, which reads the locator that `bd init`
+/// wrote. A `--backend` flag could not reach this code if it tried.
 fn dolt_ws(dx: &Dx<'_>) -> Option<DoltWs> {
     match dx.ctx.backend()? {
         Backend::Dolt => dx.dir.as_ref().map(|d| DoltWs { beads: d.clone() }),
@@ -127,8 +164,14 @@ fn dolt_ws(dx: &Dx<'_>) -> Option<DoltWs> {
 
 /// A Dolt workspace with no `dolt` on `PATH` is a real, diagnosable state: the
 /// workspace is fine, the *machine* is missing a tool, and every command that
-/// touches the store will fail until it is installed. Saying so once, clearly,
-/// is worth more than the ten downstream failures it causes.
+/// touches the store will fail until it is installed. Saying so once, clearly, is
+/// worth more than the ten downstream failures it causes.
+///
+/// The resolution is [`bd_dolt::which_dolt`] and nothing else. Doctor once had its
+/// own `which`, which tried every `PATHEXT` — so on a machine with only a
+/// `dolt.cmd` shim, doctor would report `ok` about a binary `bd` itself could
+/// never find. A diagnostic that disagrees with the thing it is diagnosing is not
+/// a diagnostic.
 struct DoltBinary;
 
 #[async_trait]
@@ -146,7 +189,7 @@ impl Check for DoltBinary {
             return Finding::na(self.name(), NOT_DOLT);
         }
 
-        let Some(path) = which_dolt() else {
+        let Some(path) = bd_dolt::which_dolt() else {
             return Finding::error(self.name(), "no `dolt` on PATH")
                 .detail(
                     "This workspace's backend is dolt, so every command that opens the store \
@@ -155,17 +198,19 @@ impl Check for DoltBinary {
                 .fix("install dolt — https://docs.dolthub.com/introduction/installation");
         };
 
-        // Only now that we know it exists do we pay for a process. `dolt
-        // version` touches no database and no lock; it is safe under rule 3.
-        match run_cmd("dolt", &["version"], Duration::from_secs(5)).await {
+        // Only now that we know it exists do we pay for a process — and we run
+        // *the path we resolved*, not a bare `dolt`, so we cannot report the
+        // version of one binary and the location of another. `dolt version`
+        // touches no database and takes no lock; it is safe under rule 3.
+        match run_cmd(path.as_os_str(), &["version"], Duration::from_secs(5)).await {
             Some(out) if out.status.success() => {
                 let v = first_line(&String::from_utf8_lossy(&out.stdout));
                 Finding::ok(self.name(), if v.is_empty() { "found".into() } else { v })
                     .detail(path.display().to_string())
             }
-            // On PATH but will not run: a broken install, a wrong architecture,
-            // a shim that shells out to something that isn't there. That is not
-            // `ok`, and it is not the workspace's fault either.
+            // On PATH but will not run: a broken install, a wrong architecture, a
+            // shim that shells out to something that isn't there. Not `ok`, and
+            // not the workspace's fault either.
             _ => Finding::warn(self.name(), "`dolt` is on PATH but would not run")
                 .detail(path.display().to_string())
                 .fix("check the install: `dolt version`"),
@@ -173,48 +218,15 @@ impl Check for DoltBinary {
     }
 }
 
-/// `which`, without a crate. Splits `PATH`, and on Windows tries each `PATHEXT`.
-fn which_dolt() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let exts = executable_suffixes();
-    for dir in std::env::split_paths(&path) {
-        for ext in &exts {
-            let candidate = dir.join(format!("dolt{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn executable_suffixes() -> Vec<String> {
-    if cfg!(windows) {
-        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
-        let mut v: Vec<String> = raw
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        // A bare `dolt` with no extension is still worth trying (a shell shim,
-        // or a WSL-ish setup).
-        v.push(String::new());
-        v
-    } else {
-        vec![String::new()]
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 2. Is there a dolt database on disk?
 // ---------------------------------------------------------------------------
 
-/// A Dolt-backed workspace whose `.beads/dolt/.dolt/` does not exist has not
-/// been initialised — every store operation will fail. This is the one check in
-/// the family that distinguishes "not set up" from "set up and broken", and the
-/// others lean on it: they report *absence* as nothing, so that the missing
-/// database is named exactly once.
+/// A Dolt-backed workspace with no `.beads/.dolt/` has not been initialised —
+/// every store operation will fail, and `bd_dolt::open` says so in as many words.
+/// This is the one check in the family that distinguishes "not set up" from "set
+/// up and broken", and the others lean on it: they report the *absence* of the
+/// database as [`Finding::na`], so the missing database is named exactly once.
 struct DoltDatabase;
 
 #[async_trait]
@@ -233,28 +245,51 @@ impl Check for DoltDatabase {
         };
 
         if !ws.dot_dolt().is_dir() {
+            // Before blaming the user's backup: is the database simply somewhere
+            // this binary does not look? Upstream Go beads keeps it in
+            // `.beads/dolt/`, and a workspace created by it is not one this port
+            // can open. "The database is missing" would be true and useless — the
+            // database is *right there*, under a name we do not read.
+            if ws.upstream_dot_dolt().is_dir() {
+                return Finding::error(self.name(), "the dolt database is in the Go layout")
+                    .detail(format!(
+                        "{} does not exist, but {} does. This workspace was created by the Go \
+                         implementation of beads, which keeps the dolt repository in \
+                         `.beads/dolt/`; this port makes `.beads/` itself the repository. The data \
+                         is intact — it is in a place this binary does not read.",
+                        ws.dot_dolt().display(),
+                        ws.upstream_dot_dolt().display()
+                    ))
+                    .fix(
+                        "use the Go `bd` for this workspace, or export and re-import: \
+                         `bd export --format=jsonl` with the Go binary, then `bd init \
+                         --backend=dolt` and `bd import` with this one",
+                    );
+            }
+
             return Finding::error(self.name(), "the dolt database is missing")
                 .detail(format!(
-                    "the locator says this workspace is dolt-backed, but {} does not exist",
+                    "the locator says this workspace is dolt-backed, but {} does not exist. \
+                     The database is missing, not merely closed.",
                     ws.dot_dolt().display()
                 ))
-                .fix("`bd init` for a new project, or restore .beads/dolt from your backup");
+                .fix("`bd init --backend=dolt` for a new project, or restore .beads/ from a backup");
         }
 
         if !ws.manifest().is_file() {
-            // `.dolt/` without a manifest: an interrupted init, or a partial
-            // copy. Warn, not error — the data may still be recoverable, and
-            // this port cannot tell.
+            // `.dolt/` without a manifest: an interrupted `dolt init`, or a
+            // partial copy. Warn, not error — the data may still be recoverable
+            // and this port cannot tell.
             return Finding::warn(self.name(), "the dolt database looks half-initialised")
                 .detail(format!(
                     "{} exists but {} does not",
                     ws.dot_dolt().display(),
                     ws.manifest().display()
                 ))
-                .fix("`dolt status` in .beads/dolt to see what dolt makes of it");
+                .fix("`dolt status` in .beads to see what dolt makes of it");
         }
 
-        Finding::ok(self.name(), "present").detail(ws.dolt().display().to_string())
+        Finding::ok(self.name(), "present").detail(ws.dot_dolt().display().to_string())
     }
 }
 
@@ -264,8 +299,8 @@ impl Check for DoltDatabase {
 
 /// Dolt's noms manifest names the storage format in its second colon-separated
 /// field. `__DOLT__` is the current one; `__LD_1__` is the pre-1.0 format, which
-/// current Dolt will refuse to open until it is migrated. Reading it costs one
-/// small file read and no lock — which is the whole reason to do it from disk
+/// current Dolt refuses to open until it is migrated. Reading it costs one small
+/// file read and takes no lock — which is the whole reason to do it from disk
 /// rather than by asking a server that may not be running.
 struct StorageFormat;
 
@@ -297,8 +332,9 @@ impl Check for StorageFormat {
         let manifest = ws.manifest();
         if !manifest.is_file() {
             // `dolt database` already reports this, with the right severity.
-            // Saying it twice would double-count one problem.
-            return Finding::ok(self.name(), "no dolt database to inspect");
+            // Saying it twice would double-count one problem — and saying `ok`
+            // would claim we verified a format we never read.
+            return Finding::na(self.name(), "no dolt database to inspect");
         }
 
         let raw = match std::fs::read_to_string(&manifest) {
@@ -319,7 +355,7 @@ impl Check for StorageFormat {
                         "{} declares {tag}; current dolt reads only __DOLT__",
                         manifest.display()
                     ))
-                    .fix("`cd .beads/dolt && dolt migrate` — take a backup of .beads/dolt first")
+                    .fix("`cd .beads && dolt migrate` — take a backup of .beads/ first")
             }
             Some(Format::Unrecognised(tag)) => Finding::unknown(
                 self.name(),
@@ -338,9 +374,11 @@ impl Check for StorageFormat {
 ///
 /// Deliberately tolerant: rather than asserting the field index, it takes the
 /// first `__…__` token among the leading fields. A manifest layout we do not
-/// recognise yields `None`, which the caller turns into a *warning*, never an
-/// `ok` — being wrong about dolt's file format must not silently report a
+/// recognise yields `None`, which the caller turns into [`Status::Unknown`] —
+/// never `ok`. Being wrong about dolt's file format must not silently report a
 /// legacy database as healthy.
+///
+/// [`Status::Unknown`]: super::super::Status::Unknown
 fn classify_format(manifest: &str) -> Option<Format> {
     let line = manifest.lines().next()?.trim();
     let tag = line
@@ -360,33 +398,61 @@ fn classify_format(manifest: &str) -> Option<Format> {
 // 4. The server — the check this family exists for
 // ---------------------------------------------------------------------------
 
-/// A `dolt sql-server` that died without cleaning up leaves `.beads/dolt-server.pid`
-/// behind. The next `bd` command reads that file, tries to talk to a server that
-/// is not there, and fails with an error that reads *exactly* like database
-/// corruption. Users then delete `.beads/` — losing everything — to fix a
-/// problem whose real remedy is removing a twelve-byte text file.
+/// A `dolt sql-server` that died without cleaning up leaves `.beads/dolt-server.json`
+/// behind. Worse, one that is *alive and wedged* holds dolt's database lock: the
+/// next `bd` command fails with an error that reads **exactly** like database
+/// corruption, and the user deletes `.beads/` to fix it — which, because `.beads/`
+/// *is* the dolt repository, destroys every issue they have.
 ///
-/// So this check's whole job is to be believed. It states, in the finding
-/// itself, that this is not corruption and that `.beads/dolt/` must not be
+/// So this check's whole job is to be believed. It states, inside the finding
+/// itself, that this is not corruption and that `.beads/.dolt/` must not be
 /// deleted.
 struct Server;
 
-/// The startup race: a server whose pid file was written moments ago may simply
-/// not be listening yet. Below this age, "not listening" is reported as
-/// *starting*, not as wedged.
+/// A record younger than this gets the benefit of the doubt when its port has
+/// gone quiet.
+///
+/// Note what changed with the real layout: `bd-dolt` writes the record *after*
+/// the server has answered on its port, not when it spawns. So "the record is
+/// young and the port is silent" no longer means "still starting" — it means the
+/// server was serving moments ago and is briefly not. Restarting, saturated, or
+/// dying. Either way, calling that an `error` on the first sighting is crying
+/// wolf; a second look a moment later settles it.
 const STARTUP_GRACE: Duration = Duration::from_secs(30);
+
+/// What is on disk, in one place. `bd-dolt` does the parsing; we only decide what
+/// it means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Record {
+    /// No server record. Normal: bd starts one on demand.
+    Absent,
+    /// The file is there and we could not read it *at all* (permissions, I/O).
+    /// **Not** the same as absent — treating an unreadable file as "no server" is
+    /// how a diagnostic quietly stops diagnosing.
+    Unreadable(String),
+    /// The file is there and `bd-dolt` cannot parse it: a torn write, a
+    /// hand-edit. Carries the raw bytes, because the evidence is the point.
+    ///
+    /// Worth cleaning even though `bd-dolt` tolerates it: `try_adopt` reads it as
+    /// *absent* and, crucially, does **not** delete it — so it lingers forever.
+    Corrupt(String),
+    /// A record `bd-dolt` itself parsed. pid and port arrive **together**; there
+    /// is no state in which we know one and not the other.
+    Present(PidFile),
+}
 
 /// What the filesystem and the OS say. Gathered impurely, judged purely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerFacts {
-    /// `None`: no pid file. `Some(Err)`: there is one and it is not a number.
-    pid: Option<Result<u32, String>>,
-    /// Age of the pid file, if we could stat it.
-    pid_age: Option<Duration>,
+    record: Record,
+    /// Age of the server record, if we could stat it.
+    record_age: Option<Duration>,
+    /// `None` when there was no pid to probe.
     liveness: Option<Liveness>,
-    port: Option<u16>,
-    /// `None` when there was no port to probe.
-    listening: Option<bool>,
+    /// Is the *recorded* port serving MySQL? `None` when there was no port.
+    serving: Option<bool>,
+    /// `BD_DOLT_PORT`, and whether something is serving there. `None` when unset.
+    env_port: Option<(u16, bool)>,
 }
 
 /// What the OS says about a process id.
@@ -399,37 +465,47 @@ enum Liveness {
     Alive { image: Option<String> },
     Dead,
     /// The probe failed. **Not** the same as `Dead` — treating a failed probe as
-    /// "the process is gone" would have doctor cheerfully delete the pid file of
-    /// a perfectly healthy server.
+    /// "the process is gone" would have doctor cheerfully delete the record of a
+    /// perfectly healthy server.
     Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
-    /// No pid file. Normal: bd starts a server on demand.
+    /// No record and no `BD_DOLT_PORT`. Normal: bd starts a server on demand.
     NotTracked,
+    /// `BD_DOLT_PORT` names a port that is serving. bd will **adopt** that server
+    /// rather than start one, and will not touch our record — so the record is
+    /// not even consulted here, exactly as `bd-dolt` does not consult it.
+    Adopted { port: u16 },
+    /// `BD_DOLT_PORT` is set and nothing is answering there. Not a fault: bd will
+    /// start a server on precisely that port.
+    EnvPortIdle { port: u16 },
     Running { pid: u32, port: u16 },
-    /// Alive, is a dolt, but nothing is listening on its port, and it has had
-    /// long enough to get there. This is the wedged server.
+    /// Alive, is a dolt, not serving — but the record is younger than the grace.
+    Starting { pid: u32, port: u16 },
+    /// Alive, is a dolt, and **not serving** long past the grace. This is the
+    /// wedged server, and it is holding the database lock.
     Wedged { pid: u32, port: u16 },
-    /// Alive, is a dolt, and the pid file is younger than the startup grace.
-    Starting { pid: u32 },
-    /// Alive, is a dolt, but we have no port for it.
-    PortUnknown { pid: u32 },
     /// The process is gone. **Stale.**
-    Dead { pid: u32 },
-    /// A process with that id exists but it is not a dolt. On Windows this is
-    /// the common case for a stale pid file. **Stale.**
+    Dead { pid: u32, port: u16 },
+    /// A process with that id exists but it is not a dolt. On Windows this is the
+    /// common case for a stale record. **Stale.**
     Reused { pid: u32, image: String },
-    /// The pid file exists and is not a number. **Stale.**
+    /// The record exists and `bd-dolt` cannot parse it. **Stale.**
     Corrupt { raw: String },
-    /// We could not tell. Warn, and do not touch anything.
+    /// We could not tell. Report `unknown`, and touch nothing.
     Undeterminable { why: String },
 }
 
 impl Verdict {
     /// Only these three are safe to clean up automatically: in each, the process
     /// bd recorded is provably not serving this workspace.
+    ///
+    /// `Wedged` is deliberately absent. Its record is *accurate* — there really is
+    /// a dolt on that pid — and deleting it would only make the next `bd` start a
+    /// second server against a database dolt has already locked, turning a
+    /// diagnosable problem into a confusing one. Doctor does not kill processes.
     fn is_stale(&self) -> bool {
         matches!(
             self,
@@ -438,63 +514,94 @@ impl Verdict {
     }
 }
 
-/// The whole state machine, as one pure function — because this is the logic
-/// that decides whether doctor deletes a file, and it must be testable without
-/// a dolt binary, a server, or a real process to kill.
+/// The whole state machine, as one pure function — because this is the logic that
+/// decides whether doctor deletes a file, and it must be testable without a dolt
+/// binary, a server, or a real process to kill.
 fn assess(f: &ServerFacts) -> Verdict {
-    let pid = match &f.pid {
-        None => return Verdict::NotTracked,
-        Some(Err(raw)) => return Verdict::Corrupt { raw: raw.clone() },
-        Some(Ok(pid)) => *pid,
+    // `BD_DOLT_PORT` first, and it wins outright. `bd_dolt::server::try_adopt`
+    // consults *only* that port when it is set — it never opens the record — so a
+    // doctor that diagnosed the record here would be diagnosing a file bd is about
+    // to ignore.
+    if let Some((port, serving)) = f.env_port {
+        return if serving {
+            Verdict::Adopted { port }
+        } else {
+            Verdict::EnvPortIdle { port }
+        };
+    }
+
+    let rec = match &f.record {
+        Record::Absent => return Verdict::NotTracked,
+        Record::Unreadable(why) => {
+            return Verdict::Undeterminable {
+                why: format!("cannot read {PID_FILE}: {why}"),
+            };
+        }
+        Record::Corrupt(raw) => return Verdict::Corrupt { raw: raw.clone() },
+        Record::Present(rec) => *rec,
     };
 
     let liveness = match &f.liveness {
-        None | Some(Liveness::Unknown(_)) => {
-            let why = match &f.liveness {
-                Some(Liveness::Unknown(w)) => w.clone(),
-                _ => "the process was not probed".to_string(),
+        None => {
+            return Verdict::Undeterminable {
+                why: "the process was not probed".to_string(),
             };
-            return Verdict::Undeterminable { why };
+        }
+        Some(Liveness::Unknown(why)) => {
+            return Verdict::Undeterminable { why: why.clone() };
         }
         Some(l) => l,
     };
 
     let image = match liveness {
-        Liveness::Dead => return Verdict::Dead { pid },
+        // The recorded process is gone, so the record is false regardless of what
+        // may now be listening on its port. (`bd-dolt` decides adoption on the
+        // port alone; doctor has the *extra* evidence of the pid, and a record
+        // naming a dead process is stale even if a stranger happens to answer
+        // there — adopting a stranger's database is not a recovery.)
+        Liveness::Dead => {
+            return Verdict::Dead {
+                pid: rec.pid,
+                port: rec.port,
+            };
+        }
         Liveness::Alive { image } => image,
         Liveness::Unknown(_) => unreachable!("handled above"),
     };
 
-    // A named process that is not a dolt means the id was recycled. A process
-    // we could not name is *not* treated as recycled — absence of evidence is
-    // not evidence, and the penalty for guessing wrong is deleting the pid file
-    // of a live server.
+    // A named process that is not a dolt means the id was recycled. A process we
+    // could not name is *not* treated as recycled — absence of evidence is not
+    // evidence, and the penalty for guessing wrong is deleting the record of a
+    // live server.
     if let Some(image) = image
         && !is_dolt_image(image)
     {
         return Verdict::Reused {
-            pid,
+            pid: rec.pid,
             image: image.clone(),
         };
     }
 
-    let Some(port) = f.port else {
-        return Verdict::PortUnknown { pid };
-    };
-
-    match f.listening {
-        Some(true) => Verdict::Running { pid, port },
+    match f.serving {
+        Some(true) => Verdict::Running {
+            pid: rec.pid,
+            port: rec.port,
+        },
         Some(false) => {
-            // Give a freshly-written pid file the benefit of the doubt: the
-            // server may still be binding its socket.
-            if f.pid_age.is_some_and(|a| a < STARTUP_GRACE) {
-                Verdict::Starting { pid }
+            if f.record_age.is_some_and(|a| a < STARTUP_GRACE) {
+                Verdict::Starting {
+                    pid: rec.pid,
+                    port: rec.port,
+                }
             } else {
-                Verdict::Wedged { pid, port }
+                Verdict::Wedged {
+                    pid: rec.pid,
+                    port: rec.port,
+                }
             }
         }
         None => Verdict::Undeterminable {
-            why: format!("port {port} was not probed"),
+            why: format!("port {} was not probed", rec.port),
         },
     }
 }
@@ -525,94 +632,109 @@ impl Check for Server {
             return Finding::na(self.name(), NOT_DOLT);
         };
 
-        let facts = gather(&ws).await;
         let n = self.name();
-
-        match assess(&facts) {
+        match assess(&gather(&ws).await) {
             Verdict::NotTracked => Finding::ok(n, "no server is running (bd starts one on demand)"),
+
+            Verdict::Adopted { port } => Finding::ok(
+                n,
+                format!("adopting the server on 127.0.0.1:{port} ({PORT_ENV})"),
+            )
+            .detail(format!(
+                "{PORT_ENV}={port} names a server that is answering; bd will use it rather than \
+                 start one of its own, and will not stop it."
+            )),
+
+            Verdict::EnvPortIdle { port } => Finding::ok(
+                n,
+                format!("no server is running ({PORT_ENV}={port}; bd will start one there)"),
+            ),
 
             Verdict::Running { pid, port } => {
                 Finding::ok(n, format!("running (pid {pid}, port {port})"))
             }
 
-            Verdict::Starting { pid } => Finding::warn(n, "a dolt server appears to be starting")
-                .detail(format!(
-                    "pid {pid} is alive but nothing is listening yet; {} was written less than {}s ago",
-                    ws.pid_file().display(),
-                    STARTUP_GRACE.as_secs()
-                ))
-                .fix("re-run `bd doctor` in a moment"),
-
-            // The one that is genuinely broken: something is holding the
-            // database and will not talk to us.
-            Verdict::Wedged { pid, port } => Finding::error(
-                n,
-                format!("a dolt server (pid {pid}) is running but not accepting connections"),
-            )
-            .detail(format!(
-                "nothing is listening on 127.0.0.1:{port}, yet pid {pid} is alive and is a dolt \
-                 process — it is most likely holding the database lock while wedged.\n\
-                 This is NOT database corruption. Do not delete .beads/dolt/."
-            ))
-            .fix(format!(
-                "stop it and let bd start a fresh one: kill {pid}, then remove {} and {}",
-                ws.pid_file().display(),
-                ws.port_file().display()
-            )),
-
-            Verdict::PortUnknown { pid } => {
-                Finding::warn(n, format!("a dolt server (pid {pid}) is running on an unknown port"))
+            Verdict::Starting { pid, port } => {
+                Finding::warn(n, "the dolt server is not answering just now")
                     .detail(format!(
-                        "{} exists but {} does not, so bd cannot reach the server it started",
+                        "pid {pid} is alive and is a dolt, but nothing is serving on \
+                         127.0.0.1:{port}. {} was written less than {}s ago, so the server was \
+                         answering very recently — it is most likely restarting, not wedged.",
                         ws.pid_file().display(),
-                        ws.port_file().display()
+                        STARTUP_GRACE.as_secs()
                     ))
-                    .fix(format!("stop pid {pid} and remove {}", ws.pid_file().display()))
+                    .fix("re-run `bd doctor` in a moment")
             }
 
+            // The one that is genuinely broken: something is holding the database
+            // and will not talk to us.
+            Verdict::Wedged { pid, port } => Finding::error(
+                n,
+                format!("a dolt server (pid {pid}) is running but not serving"),
+            )
+            .detail(format!(
+                "nothing is answering on 127.0.0.1:{port}, yet pid {pid} is alive and is a dolt \
+                 process — it is holding the database lock while wedged, so the next `bd` command \
+                 will fail with a lock error.\n\
+                 This is NOT database corruption. Do not delete .beads/.dolt/ — it IS the \
+                 database, and dolt's lock is advisory: removing it destroys nothing but does not \
+                 help either.\n\
+                 The server's own log is {}.",
+                ws.log_file().display()
+            ))
+            .fix(format!(
+                "stop it and let bd start a fresh one: kill {pid}, then remove {}",
+                ws.pid_file().display()
+            )),
+
             // ---- the rm -rf scenario ----
-            Verdict::Dead { pid } => Finding::warn(n, "a dead dolt server left its pid file behind")
-                .detail(format!(
-                    "{} names process {pid}, which no longer exists.\n\
-                     This is NOT database corruption, and the next bd command may fail with an \
-                     error that reads like it. Do not delete .beads/dolt/.",
-                    ws.pid_file().display()
-                ))
-                .fix(fix_hint(&ws)),
+            Verdict::Dead { pid, port } => {
+                Finding::warn(n, "a dead dolt server left its record behind")
+                    .detail(format!(
+                        "{} names process {pid} on port {port}, and that process no longer exists.\n\
+                         This is NOT database corruption. Do not delete .beads/.dolt/ — it IS the \
+                         database.",
+                        ws.pid_file().display()
+                    ))
+                    .fix(fix_hint(&ws))
+            }
 
             Verdict::Reused { pid, image } => {
                 Finding::warn(n, "the recorded dolt server is gone (its pid was recycled)")
                     .detail(format!(
                         "{} names process {pid}, but that id now belongs to `{image}`, not dolt. \
                          The server bd recorded is gone.\n\
-                         This is NOT database corruption. Do not delete .beads/dolt/.",
+                         This is NOT database corruption. Do not delete .beads/.dolt/ — it IS the \
+                         database.",
                         ws.pid_file().display()
                     ))
                     .fix(fix_hint(&ws))
             }
 
-            Verdict::Corrupt { raw } => {
-                Finding::warn(n, "the dolt server pid file is not a process id")
-                    .detail(format!(
-                        "{} contains {raw:?}",
-                        ws.pid_file().display()
-                    ))
-                    .fix(fix_hint(&ws))
-            }
+            Verdict::Corrupt { raw } => Finding::warn(n, "the dolt server record is unreadable")
+                .detail(format!(
+                    "{} contains {raw:?}, which is not a server record. bd ignores it, but it will \
+                     never clean it up either.",
+                    ws.pid_file().display()
+                ))
+                .fix(fix_hint(&ws)),
 
             Verdict::Undeterminable { why } => Finding::unknown(n, why),
         }
     }
 
     /// Removes **bd's own** bookkeeping, and only when the state is re-confirmed
-    /// stale at repair time. Two properties matter here:
+    /// stale at repair time. Three properties matter here:
     ///
-    /// * It re-gathers. The finding it is handed was produced before `--fix`
-    ///   asked to repair, and a server may have started in between. Acting on a
-    ///   stale verdict is how a repair kills a healthy workspace.
+    /// * It re-gathers. The finding it is handed was produced before `--fix` asked
+    ///   to repair, and a server may have started in between. Acting on a stale
+    ///   verdict is how a repair kills a healthy workspace.
+    /// * It **declines, out loud**, when the state is no longer stale. Saying
+    ///   `Unfixable` there would be a lie — doctor is perfectly able to delete the
+    ///   file and is choosing not to, which is the most important work it does.
     /// * It never goes near `.dolt/`. Dolt's own `LOCK` and manifest are its
-    ///   business; deleting them is the unrecoverable mistake this whole check
-    ///   is trying to talk the user *out of*.
+    ///   business; deleting them is the unrecoverable mistake this whole check is
+    ///   trying to talk the user *out of*.
     async fn repair(&self, dx: &Dx<'_>, _found: &Finding) -> Result<Repair> {
         let Some(ws) = dolt_ws(dx) else {
             return Ok(Repair::Unfixable);
@@ -620,82 +742,135 @@ impl Check for Server {
 
         let verdict = assess(&gather(&ws).await);
         if !verdict.is_stale() {
-            return Ok(Repair::Unfixable);
+            return Ok(Repair::Declined(decline(&verdict)));
         }
 
-        let mut removed = Vec::new();
-        for path in [ws.pid_file(), ws.port_file()] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(file_name(&path)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => bail!("cannot remove {}: {e}", path.display()),
-            }
+        let path = ws.pid_file();
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(Repair::Did(format!(
+                "removed the stale dolt server record ({}); .beads/.dolt/ was not touched",
+                file_name(&path)
+            ))),
+            // Someone beat us to it between the re-gather and here. Nothing was
+            // done, and reporting "fixed" for work we did not do is exactly the
+            // dishonesty this seam exists to prevent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Repair::Declined(format!(
+                "{} was already gone by the time --fix ran; nothing to do",
+                file_name(&path)
+            ))),
+            Err(e) => bail!("cannot remove {}: {e}", path.display()),
         }
+    }
+}
 
-        if removed.is_empty() {
-            return Ok(Repair::Unfixable);
+/// Why `--fix` is keeping its hands off a record it *could* delete.
+fn decline(v: &Verdict) -> String {
+    match v {
+        Verdict::Running { pid, port } => format!(
+            "the server came back: pid {pid} is serving on port {port}. Deleting its record now \
+             would make the next `bd` start a second server against a locked database."
+        ),
+        Verdict::Starting { pid, .. } => format!(
+            "pid {pid} is alive and answered very recently; it looks like it is restarting, not \
+             stale. Re-run `bd doctor` in a moment."
+        ),
+        Verdict::Wedged { pid, port } => format!(
+            "doctor does not kill processes. Pid {pid} is a live dolt holding the database lock \
+             but not serving on port {port}; deleting its record would only make the next `bd` \
+             start a second server that dolt's lock will reject. Kill {pid} yourself."
+        ),
+        Verdict::Adopted { port } => format!(
+            "{PORT_ENV} points at a live server on port {port}; bd is adopting it, and it is not \
+             ours to stop."
+        ),
+        Verdict::NotTracked | Verdict::EnvPortIdle { .. } => {
+            "there is no server record left to remove".to_string()
         }
-        Ok(Repair::Did(format!(
-            "removed the stale dolt server bookkeeping ({}); .beads/dolt/ was not touched",
-            removed.join(", ")
-        )))
+        Verdict::Undeterminable { why } => format!(
+            "re-checking left the state undetermined ({why}), and repairing what cannot be \
+             diagnosed is how --fix becomes the bug it was run to cure."
+        ),
+        // Unreachable: `is_stale()` sent these to the repair.
+        Verdict::Dead { .. } | Verdict::Reused { .. } | Verdict::Corrupt { .. } => {
+            "the record is stale after all".to_string()
+        }
     }
 }
 
 fn fix_hint(ws: &DoltWs) -> String {
     format!(
-        "`bd doctor --fix` — it removes {} and {}, and never touches .beads/dolt/",
-        file_name(&ws.pid_file()),
-        file_name(&ws.port_file())
+        "`bd doctor --fix` — it removes {}, and never touches .beads/.dolt/",
+        file_name(&ws.pid_file())
     )
 }
 
-/// Everything impure, in one place: read two files, ask the OS about a process,
-/// knock on a port. Nothing here decides anything.
+/// Everything impure, in one place: read one file, ask the OS about a process,
+/// knock on up to two ports. Nothing here decides anything.
 async fn gather(ws: &DoltWs) -> ServerFacts {
-    let pid_path = ws.pid_file();
-    let pid = match std::fs::read_to_string(&pid_path) {
-        Ok(raw) => Some(parse_pid(&raw)),
-        Err(_) => None,
-    };
-    let pid_age = file_age(&pid_path);
+    let path = ws.pid_file();
+    let record = read_record(&path, &ws.beads);
+    let record_age = file_age(&path);
 
-    let liveness = match &pid {
-        Some(Ok(pid)) => Some(probe_process(*pid).await),
-        _ => None,
+    let (liveness, serving) = match &record {
+        Record::Present(rec) => (
+            Some(probe_process(rec.pid).await),
+            Some(is_serving(rec.port).await),
+        ),
+        _ => (None, None),
     };
 
-    // Only probe the port if we might use the answer.
-    let port = std::fs::read_to_string(ws.port_file())
-        .ok()
-        .and_then(|raw| parse_port(&raw));
-    let listening = match (&liveness, port) {
-        (Some(Liveness::Alive { .. }), Some(p)) => Some(is_listening(p).await),
-        _ => None,
+    // A workspace with no record of its own may still have a perfectly good
+    // server: `BD_DOLT_PORT` points bd at one it did not start (docker, CI, a
+    // dev's terminal), and bd will adopt whatever answers there.
+    let env_port = match env_port() {
+        Some(p) => Some((p, is_serving(p).await)),
+        None => None,
     };
 
     ServerFacts {
-        pid,
-        pid_age,
+        record,
+        record_age,
         liveness,
-        port,
-        listening,
+        serving,
+        env_port,
     }
 }
 
-/// `Err` carries the raw text, because "the pid file says `<nul><nul><nul>`" is
-/// the evidence, and a finding that omits it cannot be acted on.
-fn parse_pid(raw: &str) -> Result<u32, String> {
-    let t = raw.trim();
-    match t.parse::<u32>() {
-        Ok(0) => Err(t.to_string()),
-        Ok(pid) => Ok(pid),
-        Err(_) => Err(t.chars().take(64).collect()),
+/// Read the server record — and let **`bd-dolt` do the parsing**.
+///
+/// The raw bytes are read only to carry as evidence when `bd-dolt` says it cannot
+/// parse them. Nothing here knows the record's shape, which is the entire point:
+/// the last version of this file did, and it was wrong.
+fn read_record(path: &Path, beads: &Path) -> Record {
+    match std::fs::read(path) {
+        Ok(bytes) => match read_pidfile(beads) {
+            Some(rec) => Record::Present(rec),
+            None => Record::Corrupt(snippet(&bytes)),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Record::Absent,
+        // Permissions, a bad symlink, an I/O error. **Not** "no server".
+        Err(e) => Record::Unreadable(e.to_string()),
     }
 }
 
-fn parse_port(raw: &str) -> Option<u16> {
-    raw.trim().parse::<u16>().ok().filter(|p| *p > 0)
+/// Enough of the bad file to see what it is, and not a byte more.
+fn snippet(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(120)];
+    String::from_utf8_lossy(head).into_owned()
+}
+
+/// `BD_DOLT_PORT`, if the user set one to something meaningful.
+///
+/// `0` is "let the OS pick", which is not an override — the same rule `bd-dolt`
+/// applies. (Its `parse_port` is private; this is the one behaviour, rather than
+/// path, that is still restated here.)
+fn env_port() -> Option<u16> {
+    std::env::var(PORT_ENV)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
 }
 
 fn file_age(p: &Path) -> Option<Duration> {
@@ -709,15 +884,21 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
-/// Rule 5: never block on a handshake. A refused connection is instant; a
-/// *dropped* packet is not, so the timeout is what bounds this.
-async fn is_listening(port: u16) -> bool {
-    tokio::task::spawn_blocking(move || {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
-    })
-    .await
-    .unwrap_or(false)
+/// Is a MySQL server **answering** on this loopback port?
+///
+/// A TCP connect is not enough, and the gap between "accepted" and "answered" is
+/// this family's entire subject. Dolt binds its listener slightly before it can
+/// serve, and a *wedged* server accepts a connection and then resets it — so a
+/// connect-only probe reports `Running` about precisely the server this check
+/// exists to catch. A MySQL server speaks first; requiring its greeting settles
+/// the question.
+///
+/// This is `bd-dolt`'s own probe, not a copy of it. Doctor carried a copy for one
+/// wave and the copy was connect-only — a copy of *semantics*, which is the same
+/// class of bug as the copied filename that put this whole family on the wrong
+/// paths. Asking the same question the same way is the entire point.
+async fn is_serving(port: u16) -> bool {
+    bd_dolt::server::probe(port, bd_dolt::server::PROBE_TIMEOUT).await
 }
 
 // --- process probing, per platform -----------------------------------------
@@ -726,15 +907,15 @@ async fn is_listening(port: u16) -> bool {
 async fn probe_process(pid: u32) -> Liveness {
     let filter = format!("PID eq {pid}");
     let args = ["/FI", filter.as_str(), "/NH", "/FO", "CSV"];
-    match run_cmd("tasklist", &args, Duration::from_secs(5)).await {
+    match run_cmd("tasklist".as_ref(), &args, Duration::from_secs(5)).await {
         Some(out) => parse_tasklist(&String::from_utf8_lossy(&out.stdout)),
         None => Liveness::Unknown("could not run `tasklist`".to_string()),
     }
 }
 
-/// `tasklist /NH /FO CSV` prints one quoted row per match, and a banner when
-/// there is none. Note that it exits 0 in *both* cases, so the exit code tells
-/// you nothing and the text is the only signal.
+/// `tasklist /NH /FO CSV` prints one quoted row per match, and a banner when there
+/// is none. Note that it exits 0 in *both* cases, so the exit code tells you
+/// nothing and the text is the only signal.
 #[cfg(any(windows, test))]
 fn parse_tasklist(text: &str) -> Liveness {
     for line in text.lines() {
@@ -776,11 +957,13 @@ async fn probe_process(pid: u32) -> Liveness {
     // macOS and the BSDs.
     let pid_s = pid.to_string();
     let args = ["-p", pid_s.as_str(), "-o", "comm="];
-    match run_cmd("ps", &args, Duration::from_secs(5)).await {
+    match run_cmd("ps".as_ref(), &args, Duration::from_secs(5)).await {
         Some(out) => {
             let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if out.status.success() && !name.is_empty() {
-                Liveness::Alive { image: Some(name) }
+                Liveness::Alive {
+                    image: Some(name.to_ascii_lowercase()),
+                }
             } else {
                 // `ps -p` exits nonzero precisely when there is no such process.
                 Liveness::Dead
@@ -789,158 +972,16 @@ async fn probe_process(pid: u32) -> Liveness {
         None => Liveness::Unknown("could not run `ps`".to_string()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// 5. bd's own lock files
-// ---------------------------------------------------------------------------
-
-/// The lock files bd itself writes into `.beads/` while bringing Dolt up. A
-/// crashed bootstrap leaves one behind, and the next bootstrap waits on a lock
-/// nobody holds.
-///
-/// Scope, deliberately: only the top level of `.beads/`, only files bd wrote.
-/// Dolt's `.dolt/noms/LOCK` is *not* here and never will be — it is an advisory
-/// lock the OS releases on process death, so its mere presence proves nothing,
-/// and deleting it can destroy the database.
-struct LockFiles;
-
-#[derive(Debug, PartialEq, Eq)]
-struct StaleLock {
-    name: String,
-    age: Duration,
-    threshold: Duration,
-}
-
-/// How long each lock may legitimately be held. A bootstrap that has not
-/// finished in five minutes is not slow, it is dead.
-fn threshold_for(name: &str) -> Option<Duration> {
-    if name == "dolt.bootstrap.lock" {
-        return Some(Duration::from_secs(5 * 60));
-    }
-    if name == "dolt-server.lock" {
-        return Some(Duration::from_secs(5 * 60));
-    }
-    if name.ends_with(".startlock") {
-        // Start-up locks are held across one spawn. Thirty seconds is already
-        // generous.
-        return Some(Duration::from_secs(30));
-    }
-    None
-}
-
-/// Pure enough to test: the fs read is one `read_dir`, and the judgement is age
-/// against threshold.
-fn stale_locks(beads: &Path) -> Vec<StaleLock> {
-    let Ok(entries) = std::fs::read_dir(beads) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(threshold) = threshold_for(&name) else {
-            continue;
-        };
-        if !e.path().is_file() {
-            continue;
-        }
-        let Some(age) = file_age(&e.path()) else {
-            continue;
-        };
-        if age > threshold {
-            out.push(StaleLock {
-                name,
-                age,
-                threshold,
-            });
-        }
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
-
-#[async_trait]
-impl Check for LockFiles {
-    fn name(&self) -> &'static str {
-        "dolt lock files"
-    }
-
-    fn category(&self) -> Category {
-        Category::Dolt
-    }
-
-    async fn run(&self, dx: &Dx<'_>) -> Finding {
-        let Some(ws) = dolt_ws(dx) else {
-            return Finding::na(self.name(), NOT_DOLT);
-        };
-
-        let stale = stale_locks(&ws.beads);
-        if stale.is_empty() {
-            return Finding::ok(self.name(), "no stale lock files");
-        }
-
-        let detail = stale
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}: held {}s (a live one is never held more than {}s)",
-                    s.name,
-                    s.age.as_secs(),
-                    s.threshold.as_secs()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Finding::warn(
-            self.name(),
-            format!("{} stale lock file(s) from a crashed bd", stale.len()),
-        )
-        .detail(detail)
-        .fix("`bd doctor --fix` — it removes only bd's own locks in .beads/, never anything in .beads/dolt/")
-    }
-
-    async fn repair(&self, dx: &Dx<'_>, _found: &Finding) -> Result<Repair> {
-        let Some(ws) = dolt_ws(dx) else {
-            return Ok(Repair::Unfixable);
-        };
-
-        // Re-check: a lock that became legitimate between run and repair (a
-        // bootstrap that just started) must not be yanked out from under it.
-        let stale = stale_locks(&ws.beads);
-        if stale.is_empty() {
-            return Ok(Repair::Unfixable);
-        }
-
-        let mut removed = Vec::new();
-        for s in &stale {
-            let path = ws.beads.join(&s.name);
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(s.name.clone()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => bail!("cannot remove {}: {e}", path.display()),
-            }
-        }
-        if removed.is_empty() {
-            return Ok(Repair::Unfixable);
-        }
-        Ok(Repair::Did(format!(
-            "removed {} stale lock file(s): {}",
-            removed.len(),
-            removed.join(", ")
-        )))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 6. Dolt remotes vs the git origin
 // ---------------------------------------------------------------------------
 
-/// Beads syncs its issues through Dolt, and its code through git. Pointing a
-/// Dolt remote at the git origin aims both at the same endpoint, and the two
-/// then fight over the same refs.
+/// Beads syncs its issues through Dolt, and its code through git. Pointing a Dolt
+/// remote at the git origin aims both at the same endpoint, and the two then fight
+/// over the same refs.
 ///
-/// Read from `.dolt/repo_state.json` rather than by querying `dolt_remotes` on
-/// a server: it is a plain file, it needs no server, and it takes no lock.
+/// Read from `.beads/.dolt/repo_state.json` rather than by querying `dolt_remotes`
+/// on a server: it is a plain file, it needs no server, and it takes no lock.
 struct RemoteVsOrigin;
 
 #[async_trait]
@@ -958,11 +999,15 @@ impl Check for RemoteVsOrigin {
             return Finding::na(self.name(), NOT_DOLT);
         };
 
+        // No database at all: `dolt database` owns that finding, and there is
+        // nothing here to compare. Not `ok` — we verified nothing.
+        if !ws.dot_dolt().is_dir() {
+            return Finding::na(self.name(), "no dolt database to inspect");
+        }
+
         let state = ws.repo_state();
         let remotes = match std::fs::read_to_string(&state) {
-            // No repo_state.json means no dolt database (or a very old one).
-            // `dolt database` owns that finding; here it is simply nothing.
-            Err(_) => return Finding::ok(self.name(), "no dolt remotes configured"),
+            Err(_) => Vec::new(),
             Ok(raw) => match remotes_from_repo_state(&raw) {
                 Some(r) => r,
                 None => {
@@ -978,12 +1023,13 @@ impl Check for RemoteVsOrigin {
             return Finding::ok(self.name(), "no dolt remotes configured");
         }
 
-        // Beads does not require git. No repo, no origin, nothing to disagree.
+        // Beads does not require git. No repo, no origin, nothing to disagree —
+        // and nothing verified, either.
         let Some(root) = &dx.root else {
-            return Finding::ok(self.name(), "not a git repository");
+            return Finding::na(self.name(), "not a git repository");
         };
         let Some(origin) = git_origin(root).await else {
-            return Finding::ok(self.name(), "no git origin configured");
+            return Finding::na(self.name(), "no git origin to compare against");
         };
 
         let want = canonical_remote(&origin);
@@ -1014,7 +1060,7 @@ impl Check for RemoteVsOrigin {
              makes them fight over the same refs."
         ))
         .fix(format!(
-            "point the dolt remote somewhere else: `cd .beads/dolt && dolt remote remove {}`",
+            "point the dolt remote somewhere else: `cd .beads && dolt remote remove {}`",
             clashing[0]
         ))
     }
@@ -1022,9 +1068,9 @@ impl Check for RemoteVsOrigin {
 
 /// `.dolt/repo_state.json` → `[(name, url)]`.
 ///
-/// `None` means the file is not JSON we understand — which becomes a *warning*,
-/// not an `ok`. Returning "no remotes" for a file we failed to read would be a
-/// check that reports as coverage while checking nothing.
+/// `None` means the file is not JSON we understand — which becomes `unknown`, not
+/// `ok`. Returning "no remotes" for a file we failed to read would be a check that
+/// reports as coverage while checking nothing.
 fn remotes_from_repo_state(raw: &str) -> Option<Vec<(String, String)>> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     // A repo_state with no `remotes` key at all is normal (no remotes yet).
@@ -1043,9 +1089,9 @@ fn remotes_from_repo_state(raw: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// Enough normalisation to tell "the same remote" from "a different remote":
-/// scheme, credentials, `.git`, trailing slash, and scp-style `git@host:path`
-/// all have to go, or `git@github.com:acme/x.git` and
-/// `https://github.com/acme/x` read as two different places when they are one.
+/// scheme, credentials, `.git`, trailing slash, and scp-style `git@host:path` all
+/// have to go, or `git@github.com:acme/x.git` and `https://github.com/acme/x` read
+/// as two different places when they are one.
 fn canonical_remote(url: &str) -> String {
     let s = url.trim().trim_end_matches('/');
 
@@ -1076,7 +1122,7 @@ fn canonical_remote(url: &str) -> String {
 async fn git_origin(root: &Path) -> Option<String> {
     let root_s = root.to_string_lossy().into_owned();
     let args = ["-C", root_s.as_str(), "remote", "get-url", "origin"];
-    let out = run_cmd("git", &args, Duration::from_secs(5)).await?;
+    let out = run_cmd("git".as_ref(), &args, Duration::from_secs(5)).await?;
     if !out.status.success() {
         return None;
     }
@@ -1088,10 +1134,18 @@ async fn git_origin(root: &Path) -> Option<String> {
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-/// Rule 5, enforced in one place: a check may shell out, but it may not hang.
-/// A timed-out or unspawnable command yields `None`, which callers must turn
-/// into a *warning*, never an `ok`.
-async fn run_cmd(program: &str, args: &[&str], limit: Duration) -> Option<std::process::Output> {
+/// Rule 5, enforced in one place: a check may shell out, but it may not hang. A
+/// timed-out or unspawnable command yields `None`, which callers must turn into a
+/// warning or an `unknown` — never an `ok`.
+///
+/// Takes an `&OsStr` so a caller can run a *resolved path* rather than a bare
+/// name; `dolt binary` does exactly that, so it cannot report the version of one
+/// binary next to the location of another.
+async fn run_cmd(
+    program: &std::ffi::OsStr,
+    args: &[&str],
+    limit: Duration,
+) -> Option<std::process::Output> {
     let fut = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -1109,16 +1163,85 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doctor::Status;
+
+    // -----------------------------------------------------------------------
+    // The layout. These are the assertions the last version of this file could
+    // not have made, and their absence is what let it inspect paths that never
+    // existed while reporting a clean bill of health.
+    // -----------------------------------------------------------------------
+
+    /// `.beads/` **is** the dolt repository. Every path this family reads is
+    /// anchored there, and the two bd owns come from `bd-dolt`.
+    #[test]
+    fn every_path_agrees_with_bd_dolt() {
+        let ws = DoltWs {
+            beads: PathBuf::from("/w/.beads"),
+        };
+
+        // bd's own bookkeeping: whatever bd-dolt says, and nothing else. If
+        // bd-dolt renames the record, this follows it for free — which is the
+        // whole point.
+        assert_eq!(ws.pid_file(), bd_dolt::server::pidfile_path(Path::new("/w/.beads")));
+        assert_eq!(ws.pid_file().file_name().unwrap(), PID_FILE);
+        assert_eq!(ws.log_file().file_name().unwrap(), LOG_FILE);
+
+        // Dolt's own: directly under `.beads`, never under a `.beads/dolt/` that
+        // does not exist.
+        assert_eq!(ws.dot_dolt(), Path::new("/w/.beads/.dolt"));
+        assert_eq!(ws.manifest(), Path::new("/w/.beads/.dolt/noms/manifest"));
+        assert_eq!(ws.repo_state(), Path::new("/w/.beads/.dolt/repo_state.json"));
+    }
+
+    /// The record `bd-dolt` writes is the record doctor reads — pid and port in
+    /// one JSON object, parsed by `bd-dolt` and by nothing else.
+    #[test]
+    fn the_server_record_is_read_by_bd_dolt_and_not_reimplemented() {
+        let dir = tmp("record");
+        let path = pidfile_path(&dir);
+
+        assert_eq!(read_record(&path, &dir), Record::Absent);
+
+        // The real thing, serialized by the real type.
+        let rec = PidFile {
+            pid: 4812,
+            port: 51234,
+        };
+        std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(read_record(&path, &dir), Record::Present(rec));
+
+        // A torn write. bd-dolt reads this as *absent* and — importantly — never
+        // deletes it, so doctor is the only thing that will ever clean it up.
+        std::fs::write(&path, "{ trunca").unwrap();
+        assert_eq!(
+            read_record(&path, &dir),
+            Record::Corrupt("{ trunca".to_string())
+        );
+
+        // The old layout: a bare pid, which is what doctor used to *write* its
+        // assumptions against. It is not a record, and it must not be mistaken
+        // for one.
+        std::fs::write(&path, "4812").unwrap();
+        assert!(matches!(read_record(&path, &dir), Record::Corrupt(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // --- the state machine that decides whether we delete a file ------------
 
-    fn facts(pid: Option<Result<u32, String>>, liveness: Option<Liveness>) -> ServerFacts {
+    fn rec(pid: u32, port: u16) -> Record {
+        Record::Present(PidFile { pid, port })
+    }
+
+    /// A record an hour old, whose port is silent. The interesting axis is then
+    /// the process.
+    fn facts(record: Record, liveness: Option<Liveness>) -> ServerFacts {
         ServerFacts {
-            pid,
-            pid_age: Some(Duration::from_secs(3600)),
+            record,
+            record_age: Some(Duration::from_secs(3600)),
             liveness,
-            port: Some(3306),
-            listening: Some(false),
+            serving: Some(false),
+            env_port: None,
         }
     }
 
@@ -1129,14 +1252,14 @@ mod tests {
     }
 
     #[test]
-    fn no_pid_file_is_not_a_problem() {
+    fn no_record_is_not_a_problem() {
         // Absence is not failure: bd starts a server on demand.
         let v = assess(&ServerFacts {
-            pid: None,
-            pid_age: None,
+            record: Record::Absent,
+            record_age: None,
             liveness: None,
-            port: None,
-            listening: None,
+            serving: None,
+            env_port: None,
         });
         assert_eq!(v, Verdict::NotTracked);
         assert!(!v.is_stale());
@@ -1144,17 +1267,23 @@ mod tests {
 
     #[test]
     fn a_dead_process_is_stale_and_repairable() {
-        let v = assess(&facts(Some(Ok(4812)), Some(Liveness::Dead)));
-        assert_eq!(v, Verdict::Dead { pid: 4812 });
+        let v = assess(&facts(rec(4812, 51234), Some(Liveness::Dead)));
+        assert_eq!(
+            v,
+            Verdict::Dead {
+                pid: 4812,
+                port: 51234
+            }
+        );
         assert!(v.is_stale(), "this is the case that saves people from rm -rf");
     }
 
-    /// The Windows trap. A pid file naming 4812 plus "a process with id 4812
-    /// exists" is *not* evidence the server is alive — Windows recycles ids
-    /// within seconds. Identity is what settles it.
+    /// The Windows trap. A record naming 4812 plus "a process with id 4812 exists"
+    /// is *not* evidence the server is alive — Windows recycles ids within
+    /// seconds. Identity is what settles it.
     #[test]
     fn a_recycled_pid_is_stale_not_running() {
-        let v = assess(&facts(Some(Ok(4812)), alive("code.exe")));
+        let v = assess(&facts(rec(4812, 51234), alive("code.exe")));
         assert_eq!(
             v,
             Verdict::Reused {
@@ -1166,101 +1295,209 @@ mod tests {
     }
 
     /// The mirror of the above, and the more dangerous direction: when we cannot
-    /// name the process, we must NOT conclude the pid was recycled. Guessing
-    /// wrong here deletes the pid file of a healthy, running server.
+    /// name the process, we must NOT conclude the pid was recycled. Guessing wrong
+    /// here deletes the record of a healthy, running server.
     #[test]
     fn an_unnamed_live_process_is_never_assumed_stale() {
         let v = assess(&ServerFacts {
-            listening: Some(true),
-            ..facts(Some(Ok(4812)), Some(Liveness::Alive { image: None }))
+            serving: Some(true),
+            ..facts(rec(4812, 51234), Some(Liveness::Alive { image: None }))
         });
-        assert_eq!(v, Verdict::Running { pid: 4812, port: 3306 });
+        assert_eq!(
+            v,
+            Verdict::Running {
+                pid: 4812,
+                port: 51234
+            }
+        );
         assert!(!v.is_stale());
     }
 
-    /// A probe that failed is not a process that died. `Unknown` must never
-    /// reach a repair.
+    /// A probe that failed is not a process that died. `Unknown` must never reach
+    /// a repair — and the seam guarantees that, because `Status::Unknown` is not
+    /// actionable.
     #[test]
     fn a_failed_probe_is_undeterminable_not_dead() {
         let v = assess(&facts(
-            Some(Ok(4812)),
+            rec(4812, 51234),
             Some(Liveness::Unknown("tasklist is not on PATH".into())),
         ));
         assert!(matches!(v, Verdict::Undeterminable { .. }));
         assert!(
             !v.is_stale(),
-            "swallowing a probe failure into `dead` would have --fix delete a live server's pid file"
+            "swallowing a probe failure into `dead` would have --fix delete a live server's record"
         );
     }
 
+    /// A record we cannot *read* is not a record that is not *there*. Reporting
+    /// `NotTracked` for an unreadable file would say "no server is running" about a
+    /// workspace we never managed to look at.
     #[test]
-    fn a_live_dolt_that_nobody_can_reach_is_wedged() {
-        let v = assess(&facts(Some(Ok(4812)), alive("dolt.exe")));
-        assert_eq!(v, Verdict::Wedged { pid: 4812, port: 3306 });
-        // Wedged is NOT auto-repairable: doctor does not kill processes.
+    fn an_unreadable_record_is_undeterminable_not_absent() {
+        let v = assess(&facts(
+            Record::Unreadable("permission denied".into()),
+            None,
+        ));
+        assert!(matches!(v, Verdict::Undeterminable { .. }));
         assert!(!v.is_stale());
     }
 
-    /// The startup race: a pid file written two seconds ago whose server has not
-    /// bound its socket yet is starting, not wedged. Without this, `bd doctor`
-    /// run immediately after `bd init` reports a false error.
     #[test]
-    fn a_young_pid_file_gets_the_benefit_of_the_doubt() {
+    fn a_live_dolt_that_is_not_serving_is_wedged() {
+        let v = assess(&facts(rec(4812, 51234), alive("dolt.exe")));
+        assert_eq!(
+            v,
+            Verdict::Wedged {
+                pid: 4812,
+                port: 51234
+            }
+        );
+        // Wedged is NOT auto-repairable: doctor does not kill processes, and the
+        // record is *accurate* — there really is a dolt on that pid.
+        assert!(!v.is_stale());
+    }
+
+    /// The grace window. bd-dolt writes the record only *after* the server has
+    /// answered, so a young record whose port has gone quiet means the server was
+    /// serving moments ago — restarting, not wedged. Calling that an `error` on
+    /// first sighting is crying wolf.
+    #[test]
+    fn a_young_record_gets_the_benefit_of_the_doubt() {
         let v = assess(&ServerFacts {
-            pid_age: Some(Duration::from_secs(2)),
-            ..facts(Some(Ok(4812)), alive("dolt"))
+            record_age: Some(Duration::from_secs(2)),
+            ..facts(rec(4812, 51234), alive("dolt"))
         });
-        assert_eq!(v, Verdict::Starting { pid: 4812 });
+        assert_eq!(
+            v,
+            Verdict::Starting {
+                pid: 4812,
+                port: 51234
+            }
+        );
+        assert!(!v.is_stale());
     }
 
     #[test]
-    fn a_reachable_server_is_running() {
+    fn a_serving_server_is_running() {
         let v = assess(&ServerFacts {
-            listening: Some(true),
-            ..facts(Some(Ok(4812)), alive("dolt"))
+            serving: Some(true),
+            ..facts(rec(4812, 51234), alive("dolt"))
         });
-        assert_eq!(v, Verdict::Running { pid: 4812, port: 3306 });
+        assert_eq!(
+            v,
+            Verdict::Running {
+                pid: 4812,
+                port: 51234
+            }
+        );
+    }
+
+    /// There is no such thing as a known pid with an unknown port. They are one
+    /// JSON object, written together and read together — which is exactly what the
+    /// old `PortUnknown` verdict, and the separate `.port` file it was invented
+    /// for, got wrong.
+    #[test]
+    fn the_pid_and_the_port_are_never_apart() {
+        let dir = tmp("together");
+        let path = pidfile_path(&dir);
+        std::fs::write(&path, r#"{"pid":4812,"port":51234}"#).unwrap();
+
+        match read_record(&path, &dir) {
+            Record::Present(r) => {
+                assert_eq!(r.pid, 4812);
+                assert_eq!(r.port, 51234);
+            }
+            other => panic!("expected a record, got {other:?}"),
+        }
+
+        // Half a record is no record.
+        std::fs::write(&path, r#"{"pid":4812}"#).unwrap();
+        assert!(matches!(read_record(&path, &dir), Record::Corrupt(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_live_dolt_with_no_port_file_is_a_warning() {
-        let v = assess(&ServerFacts {
-            port: None,
-            listening: None,
-            ..facts(Some(Ok(4812)), alive("dolt"))
-        });
-        assert_eq!(v, Verdict::PortUnknown { pid: 4812 });
-    }
-
-    #[test]
-    fn a_corrupt_pid_file_is_stale() {
-        let v = assess(&facts(Some(Err("\u{0}\u{0}".into())), None));
+    fn a_corrupt_record_is_stale() {
+        let v = assess(&facts(Record::Corrupt("\u{0}\u{0}".into()), None));
         assert!(v.is_stale());
         assert!(matches!(v, Verdict::Corrupt { .. }));
     }
 
-    // --- pid/port parsing ---------------------------------------------------
+    // --- BD_DOLT_PORT --------------------------------------------------------
 
+    /// When the user points bd at a server with `BD_DOLT_PORT`, `bd-dolt` adopts
+    /// whatever answers there and never opens the record. Doctor must route the
+    /// same way — otherwise it diagnoses a file bd is about to ignore, which is the
+    /// same class of mistake as diagnosing a path that does not exist.
     #[test]
-    fn pid_parsing_keeps_the_evidence() {
-        assert_eq!(parse_pid("4812\n"), Ok(4812));
-        assert_eq!(parse_pid("  4812  "), Ok(4812));
-        // A zero pid is not a pid.
-        assert_eq!(parse_pid("0"), Err("0".to_string()));
-        assert_eq!(parse_pid(""), Err(String::new()));
-        // The raw text survives into the finding, so the user can see *why*.
-        assert_eq!(parse_pid("not a pid"), Err("not a pid".to_string()));
-        // A truncated write is the realistic corruption, and it must not panic.
-        assert!(parse_pid("48\u{0}\u{0}").is_err());
+    fn an_env_port_that_is_serving_is_adopted_and_the_record_is_not_consulted() {
+        let v = assess(&ServerFacts {
+            env_port: Some((3306, true)),
+            // A record that would otherwise read as stale. It is irrelevant here.
+            ..facts(rec(4812, 51234), Some(Liveness::Dead))
+        });
+        assert_eq!(v, Verdict::Adopted { port: 3306 });
+        assert!(
+            !v.is_stale(),
+            "an adopted server is not ours to stop, and its record is not ours to delete"
+        );
     }
 
     #[test]
-    fn port_parsing() {
-        assert_eq!(parse_port("3306\n"), Some(3306));
-        assert_eq!(parse_port("0"), None);
-        assert_eq!(parse_port("70000"), None);
-        assert_eq!(parse_port("garbage"), None);
+    fn an_env_port_with_nothing_on_it_is_where_bd_will_start_one() {
+        let v = assess(&ServerFacts {
+            env_port: Some((3306, false)),
+            ..facts(Record::Absent, None)
+        });
+        assert_eq!(v, Verdict::EnvPortIdle { port: 3306 });
+        assert!(!v.is_stale());
     }
+
+    #[test]
+    fn a_zero_env_port_is_not_an_override() {
+        // `0` means "let the OS pick", which is bd-dolt's rule too.
+        unsafe { std::env::set_var(PORT_ENV, "0") };
+        assert_eq!(env_port(), None);
+        unsafe { std::env::set_var(PORT_ENV, "notaport") };
+        assert_eq!(env_port(), None);
+        unsafe { std::env::set_var(PORT_ENV, " 3307 ") };
+        assert_eq!(env_port(), Some(3307));
+        unsafe { std::env::remove_var(PORT_ENV) };
+        assert_eq!(env_port(), None);
+    }
+
+    // --- what --fix says when it will not act -------------------------------
+
+    /// The state that used to have no honest answer. `run()` found a dead server,
+    /// `--fix` re-checked and found it alive — and the seam offered only "did it"
+    /// or "cannot do it", so a correct, protective refusal had to be reported as a
+    /// *failure*. It now declines, out loud, with the reason.
+    #[test]
+    fn a_repair_that_refuses_says_why_rather_than_claiming_it_cannot() {
+        let back = decline(&Verdict::Running {
+            pid: 4812,
+            port: 51234,
+        });
+        assert!(back.contains("second server"), "got: {back}");
+
+        let wedged = decline(&Verdict::Wedged {
+            pid: 4812,
+            port: 51234,
+        });
+        assert!(
+            wedged.contains("does not kill processes"),
+            "the refusal must say what it will not do, and why: {wedged}"
+        );
+        assert!(wedged.contains("4812"), "and name the process: {wedged}");
+
+        let unknown = decline(&Verdict::Undeterminable {
+            why: "tasklist would not run".into(),
+        });
+        assert!(unknown.contains("tasklist would not run"), "got: {unknown}");
+    }
+
+    // --- process identity ----------------------------------------------------
 
     #[test]
     fn only_a_dolt_is_a_dolt() {
@@ -1304,6 +1541,92 @@ mod tests {
         assert!(matches!(parse_tasklist(out), Liveness::Unknown(_)));
     }
 
+    // --- the serving probe ---------------------------------------------------
+
+    /// The distinction the whole `Running`/`Wedged` split rests on: a server that
+    /// **accepts and says nothing** is not serving. Dolt binds its listener before
+    /// it can answer, and a wedged one accepts and resets — so a connect-only probe
+    /// would report the wedged server as healthy, which is the single thing this
+    /// family exists to prevent.
+    #[tokio::test]
+    async fn serving_means_the_server_spoke_not_merely_that_it_accepted() {
+        let greeting = FakeServer::start(true);
+        assert!(is_serving(greeting.port).await);
+
+        let silent = FakeServer::start(false);
+        assert!(
+            !is_serving(silent.port).await,
+            "a bound-but-silent listener is exactly the wedged server; calling it Running is the bug"
+        );
+
+        // Nothing there at all.
+        let dead = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(!is_serving(dead).await);
+    }
+
+    /// A loopback listener that is not dolt. Everything about the port probe can be
+    /// tested against this, and none of it needs a real dolt — which matters,
+    /// because there is none on this machine.
+    struct FakeServer {
+        port: u16,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeServer {
+        /// `greet: true` behaves like a MySQL server (speaks first). `false` binds,
+        /// accepts, and stays silent past the prober's read timeout.
+        fn start(greet: bool) -> FakeServer {
+            use std::io::Write as _;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut sock, _)) => {
+                            if greet {
+                                let _ = sock.write_all(b"\x0a5.7.9-fake-dolt\0");
+                                let _ = sock.flush();
+                            } else {
+                                std::thread::sleep(Duration::from_millis(600));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            FakeServer {
+                port,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            self.stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
     // --- storage format -----------------------------------------------------
 
     #[test]
@@ -1320,8 +1643,8 @@ mod tests {
         );
     }
 
-    /// Being wrong about dolt's file format must degrade to a warning, never to
-    /// a silent "healthy". This is the check's whole safety property.
+    /// Being wrong about dolt's file format must degrade to `unknown`, never to a
+    /// silent "healthy". This is the check's whole safety property.
     #[test]
     fn an_unfamiliar_manifest_is_never_reported_as_healthy() {
         assert!(matches!(
@@ -1333,44 +1656,12 @@ mod tests {
         assert_eq!(classify_format("5:nope:abc:def"), None);
     }
 
-    // --- lock file staleness ------------------------------------------------
-
-    #[test]
-    fn lock_thresholds_cover_bds_files_and_nothing_of_dolts() {
-        assert!(threshold_for("dolt.bootstrap.lock").is_some());
-        assert!(threshold_for("dolt-server.lock").is_some());
-        assert!(threshold_for("bd.sock.startlock").is_some());
-        // Not ours: the sync family's, and dolt's own.
-        assert!(threshold_for(".sync.lock").is_none());
-        assert!(threshold_for("LOCK").is_none());
-        assert!(threshold_for("manifest").is_none());
-        assert!(threshold_for("beads.db").is_none());
-    }
-
-    #[test]
-    fn a_fresh_lock_is_not_stale_and_an_old_one_is() {
-        let dir = tmp("locks");
-        let lock = dir.join("dolt.bootstrap.lock");
-        std::fs::write(&lock, "1234").unwrap();
-
-        // Just written: a bootstrap may legitimately be in flight.
-        assert!(stale_locks(&dir).is_empty());
-
-        // Backdate it past the threshold.
-        backdate(&lock, Duration::from_secs(10 * 60));
-        let stale = stale_locks(&dir);
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].name, "dolt.bootstrap.lock");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A `read_dir` that fails (no `.beads/` at all) is not "there are stale
-    /// locks" and is not a panic either — doctor's input is broken workspaces.
-    #[test]
-    fn a_missing_directory_yields_no_locks_rather_than_an_error() {
-        assert!(stale_locks(Path::new("/definitely/not/here/.beads")).is_empty());
-    }
+    // The lock sweeper used to live here. It now lives in the Maintenance
+    // family (`checks/pollution.rs`), which owns every lock file under
+    // `.beads/` — because two checks that both matched `dolt.bootstrap.lock`
+    // meant two repairs racing to unlink the same file. The safety property
+    // that the sweeper never touches a file bd-dolt or dolt owns moved with it,
+    // and is asserted there against `bd-dolt`'s own constants.
 
     // --- remotes ------------------------------------------------------------
 
@@ -1431,11 +1722,10 @@ mod tests {
     // --- the SQLite path, which we *can* test end to end --------------------
 
     /// The family's central rule, asserted rather than documented: on a SQLite
-    /// workspace every one of these checks is `Ok`. Ten warnings about a Dolt
-    /// server the user never asked for is how you teach people to stop reading
-    /// `bd doctor`.
+    /// workspace every one of these checks is `n/a` — silent, and counted apart
+    /// from `ok` so that "18 ok" means eighteen things were actually verified.
     #[tokio::test]
-    async fn every_check_is_ok_and_silent_on_a_sqlite_workspace() {
+    async fn every_check_is_na_and_silent_on_a_sqlite_workspace() {
         use clap::Parser as _;
 
         let dir = tmp("sqlite-ws");
@@ -1448,9 +1738,9 @@ mod tests {
         .unwrap();
 
         // Plant everything that would make a *dolt* workspace scream: a stale
-        // pid file, an ancient bootstrap lock. None of it is any of our business
-        // here.
-        std::fs::write(beads.join(PID_FILE), "999999").unwrap();
+        // server record, an ancient bootstrap lock. None of it is any of our
+        // business here.
+        std::fs::write(pidfile_path(&beads), r#"{"pid":999999,"port":3306}"#).unwrap();
         let lock = beads.join("dolt.bootstrap.lock");
         std::fs::write(&lock, "").unwrap();
         backdate(&lock, Duration::from_secs(3600));
@@ -1463,9 +1753,10 @@ mod tests {
 
         for check in checks() {
             let f = check.run(&dx).await;
-            assert!(
-                f.is_ok(),
-                "{} must be ok on a sqlite workspace, said: {} / {:?}",
+            assert_eq!(
+                f.status,
+                Status::NotApplicable,
+                "{} must be n/a on a sqlite workspace, said: {} / {:?}",
                 check.name(),
                 f.message,
                 f.detail
@@ -1478,8 +1769,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A workspace with no `.beads/` at all — doctor's hardest input. Nothing
-    /// here may panic, and nothing may claim a Dolt problem.
+    /// A workspace with no `.beads/` at all — doctor's hardest input. Nothing here
+    /// may panic, and nothing may claim a Dolt problem.
     #[tokio::test]
     async fn no_workspace_at_all_is_not_a_dolt_problem() {
         use clap::Parser as _;

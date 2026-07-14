@@ -1434,4 +1434,40 @@ mod tests {
         }
         assert_eq!(names.len(), 6);
     }
+
+    /// The safety property, moved here from the Dolt family along with ownership
+    /// of the sweeper.
+    ///
+    /// This family deletes lock files. `.beads/` **is** the dolt repository, so
+    /// the sweeper is walking the root of a live database — and it must not match
+    /// a single file that `bd-dolt` or dolt itself writes there. The names come
+    /// from `bd-dolt`, not from a copy of them, so this stays true through a
+    /// rename. It is the assertion that would catch a future widening of the rule
+    /// to, say, `starts_with("dolt-server")` — which would delete the record of a
+    /// *running* server, and the next `bd` would start a second one that dolt's
+    /// own lock then rejects.
+    #[test]
+    fn the_sweeper_matches_nothing_that_bd_dolt_or_dolt_owns() {
+        // bd-dolt's own files, by its own constants.
+        assert!(!is_lock_name(bd_dolt::server::PID_FILE));
+        assert!(!is_lock_name(bd_dolt::server::LOG_FILE));
+
+        // Dolt's. `noms/LOCK` is the one that matters most: it is *advisory* —
+        // the OS releases it on process death — so its presence proves nothing,
+        // and deleting it can destroy the database.
+        for name in ["LOCK", "manifest", "repo_state.json", ".dolt", ".doltignore"] {
+            assert!(!is_lock_name(name), "{name} is dolt's, not debris");
+        }
+
+        // And beads' own.
+        for name in ["workspace.json", "config.yaml", "beads.db", "issues.jsonl"] {
+            assert!(!is_lock_name(name), "{name} is not debris");
+        }
+
+        // What it *does* match — including the two the Dolt family used to
+        // duplicate, which is why that duplicate is gone.
+        for name in ["dolt.bootstrap.lock", "dolt-server.lock", "bd.sock.startlock"] {
+            assert!(is_lock_name(name), "{name} is a lock and should be swept");
+        }
+    }
 }

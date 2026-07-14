@@ -65,7 +65,12 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// real error and retrying it just delays the report.
 const START_ATTEMPTS: u32 = 4;
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// How long to wait for a server to say hello before deciding nobody is there.
+///
+/// Public because `bd doctor` probes the same port for the same reason, and a
+/// doctor with a *different* timeout would disagree with `bd` about whether the
+/// server is up — which is the whole class of bug this module is trying to end.
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Upper bound on how long `Drop` will block. A `SIGKILL`ed process is reaped in
 /// microseconds; this only exists so a pathological kernel cannot hang `bd`.
@@ -570,7 +575,12 @@ fn free_port() -> Result<u16> {
     Ok(port)
 }
 
-fn env_port() -> Option<u16> {
+/// The port `BD_DOLT_PORT` pins us to, if any.
+///
+/// Public because `try_adopt` consults *only* this when it is set, and never
+/// opens the pid record. A doctor that did not know that would diagnose a file
+/// `bd` is about to ignore. Note `0` is not an override — it is a typo.
+pub fn env_port() -> Option<u16> {
     parse_port(&std::env::var(PORT_ENV).ok()?)
 }
 
@@ -601,7 +611,16 @@ fn probe_blocking(addr: SocketAddr, timeout: Duration) -> bool {
     matches!(sock.read(&mut buf), Ok(n) if n > 0)
 }
 
-async fn probe(port: u16, timeout: Duration) -> bool {
+/// Is something **serving MySQL** on this port?
+///
+/// Not "is the port open". Dolt binds its listener slightly before it can serve,
+/// and a *wedged* server accepts the connection and then never speaks — so a
+/// bare TCP connect reports a healthy server for exactly the failure this is
+/// meant to detect. Readiness means a greeting byte.
+///
+/// Public for `bd doctor`, which must ask this question the same way `bd` does.
+/// It had its own copy for one wave, and that copy was connect-only.
+pub async fn probe(port: u16, timeout: Duration) -> bool {
     let addr = SocketAddr::from((LOOPBACK, port));
     tokio::task::spawn_blocking(move || probe_blocking(addr, timeout))
         .await
