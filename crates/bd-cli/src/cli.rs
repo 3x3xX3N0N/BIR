@@ -578,7 +578,15 @@ pub enum Commands {
         cmd: FormulaCmd,
     },
     /// Run a formula
-    Cook { formula: PathBuf },
+    Cook {
+        formula: PathBuf,
+        /// Bind a formula variable: `--var feature=auth`. Repeatable.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+        /// Compile and print the plan without creating any issues.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Agent swarms
     Swarm {
         #[command(subcommand)]

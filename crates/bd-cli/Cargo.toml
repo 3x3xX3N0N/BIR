@@ -18,6 +18,7 @@ bd-core = { workspace = true }
 bd-query = { workspace = true }
 bd-sqlite = { workspace = true }
 bd-dolt = { workspace = true }
+bd-formula = { workspace = true }
 bd-storage = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }

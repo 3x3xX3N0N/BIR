@@ -12,6 +12,7 @@
 //! on SQLite would look like unfinished work forever.
 
 pub mod advanced;
+pub mod formula;
 pub mod deps;
 pub mod issues;
 pub mod maintenance;
@@ -245,7 +246,11 @@ pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
         // ----- Advanced -----
         C::Mol { cmd } => advanced::mol(ctx, cmd).await,
         C::Formula { cmd } => advanced::formula(ctx, cmd).await,
-        C::Cook { formula } => advanced::cook(ctx, formula).await,
+        C::Cook {
+            formula,
+            vars,
+            dry_run,
+        } => advanced::cook(ctx, formula, vars, dry_run).await,
         C::Swarm { cmd } => advanced::swarm(ctx, cmd).await,
         C::Gate { cmd } => advanced::gate(ctx, cmd).await,
         C::Rules { cmd } => advanced::rules(ctx, cmd).await,

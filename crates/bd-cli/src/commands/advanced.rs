@@ -4,11 +4,10 @@
 //! of them assumes the core below it works. Porting them before `bd ready` is
 //! solid would be building the roof first.
 
-use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::cli::{FormulaCmd, GateCmd, HumanCmd, MolCmd, RulesCmd, SwarmCmd, TodoCmd};
+use crate::cli::{GateCmd, HumanCmd, MolCmd, RulesCmd, SwarmCmd, TodoCmd};
 use crate::commands::stub;
 use crate::context::Ctx;
 
@@ -29,21 +28,10 @@ pub async fn mol(ctx: &Ctx, cmd: MolCmd) -> Result<()> {
     stub(name, ctx)
 }
 
-pub async fn formula(ctx: &Ctx, cmd: FormulaCmd) -> Result<()> {
-    let name = match cmd {
-        FormulaCmd::List => "formula list",
-        FormulaCmd::Show { .. } => "formula show",
-        FormulaCmd::Convert { .. } => "formula convert",
-        FormulaCmd::Schema => "formula schema",
-    };
-    stub(name, ctx)
-}
-
-/// Running a formula is the formula DSL's whole reason to exist, so this is
-/// unbuilt work (exit 64) rather than anything the backend could refuse.
-pub async fn cook(ctx: &Ctx, _formula: PathBuf) -> Result<()> {
-    stub("cook", ctx)
-}
+// `formula …` and `cook` live in `crate::commands::formula`, over the
+// `bd_formula` compiler. They are the DSL's whole reason to exist and are big
+// enough to be their own module.
+pub use crate::commands::formula::{cook, formula};
 
 pub async fn swarm(ctx: &Ctx, cmd: SwarmCmd) -> Result<()> {
     let name = match cmd {
