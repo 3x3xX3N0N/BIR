@@ -89,8 +89,45 @@ moment a pull completes. Skip it and `bd ready` is quietly wrong after every
 sync — no error, no crash, just the wrong work.
 
 ### Wave 4 — doctor (own one **new** check file each)
-Each agent owns `doctor/checks/<name>.rs` and implements the `Check` trait.
-The registry is written by the integrator before the wave.
+
+Upstream has ~113 checks registered by appending to one list in one file. That
+shape works for one author and deadlocks for nine: everyone edits the same lines,
+and in a single working tree concurrent edits to one file are not a merge
+conflict — they are a **silently lost write**.
+
+So the registry is *composed*, not appended to. Each family exposes `checks()`;
+`doctor/checks/mod.rs` concatenates them. Adding a check means editing your own
+file and nothing else.
+
+| Agent | Owns `doctor/checks/…` | Category |
+|---|---|---|
+| 1 | `core.rs` — opens at all, integrity, schema version, permissions, migrations | Core System |
+| 2 | `graph.rs` — **blocked-cache consistency**, cycles, orphans, duplicates | Data & Config |
+| 3 | `identity.rs` — prefix vs. ids on disk, config sanity, fingerprint | Metadata |
+| 4 | `git.rs` — conflict markers, hooks, gitignore, runtime files tracked | Git Integration |
+| 5 | `dolt.rs` — server reachable, **stale locks**, schema, remotes | Dolt Storage |
+| 6 | `pollution.rs` — stale locks/molecules/hooks, debris | Maintenance |
+| 7 | `runtime.rs` — **`bd` on PATH (and which one)**, version skew, fs quirks | Runtime |
+| 8 | `federation.rs` — peers, conflicts, sync staleness (**no network**) | Federation |
+| 9 | `agents.rs` — Claude/Cursor/Codex/… hooks and settings | Integrations |
+
+Frozen for this wave: `doctor/mod.rs` and `doctor/checks/mod.rs`.
+
+**Agent 2 owns the most important check in the program.** `is_blocked` is a
+denormalized cache maintained to a fixpoint by local write paths. Anything that
+lands rows without going through one — a merge, a pull, an import — leaves it
+stale, and a stale cache makes `bd ready` hand out the wrong work with no error
+anywhere. It is the only check here whose repair is both obvious and always
+safe: `recompute_blocked()`.
+
+**The rule that decides whether anyone ever reads doctor's output:** absence is
+not a failure. A user who does not use Cursor has no Cursor problem. Nine
+warnings about editors somebody doesn't use will train them to skim past the one
+that matters. Warn only when a thing is *present but broken*.
+
+**And the inverse, which is worse:** a check that hits an error, swallows it, and
+returns `Ok` is worse than no check at all, because it reports as coverage. When
+you cannot determine the answer, say `Finding::unknown` — never `Ok`.
 
 ### Wave 5 — the formula DSL
 Deliberately **not** sharded. It is one compiler — inheritance, loops, gates,
