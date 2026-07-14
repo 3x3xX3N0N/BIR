@@ -1,241 +1,192 @@
-# Port status — `bd` CLI (Rust)
+# Port status — `bd` (Rust)
 
 The command surface is **complete**: every command upstream has is registered,
-with its flags, aliases, and help. What varies is what happens when you run one.
+with its flags, aliases and help. What varies is what happens when you run one.
+
+**643 tests. Two backends: SQLite (complete) and Dolt (complete, unverified —
+see the bottom of this file).**
 
 ## How to resume
 
-1. `cargo build` — the binary must always compile. `bd --help` prints the whole
-   map, grouped by family.
-2. Pick a `stub` row below. Its handler is already wired into
-   `crates/bd-cli/src/commands/` and named in the dispatch table
-   (`commands/mod.rs`); it currently calls `stub("<name>", ctx)`. Replace that
-   call with the real implementation, against `Box<dyn Storage>` — never against
-   a concrete backend.
-3. Move the row to `done` here, in the same commit. This table is the only
-   durable record of where the port is.
+1. `cargo test --workspace` and `cargo clippy --workspace --all-targets`. Both
+   must be clean before you start and clean when you stop.
+2. Pick a `stub` row. Its handler already exists in `crates/bd-cli/src/commands/`
+   and is already wired into the dispatch table; it calls `stub("<name>", ctx)`.
+   Replace that call. Code against `Box<dyn Storage>`, never a concrete backend.
+3. Move the row here, in the same commit. **This file is the only durable record
+   of where the port is**, and it has been wrong before.
 
-Rules that are not negotiable (they come from the storage seam, and every one of
-them was a real bug upstream):
+Read `OWNERSHIP.md` before running agents in parallel. It is the thing that makes
+fan-out safe, and it was written after finding the two shared files that every
+agent would otherwise have had to edit.
 
-- Code against `bd_storage::Storage`. The only two places allowed to name a
-  concrete backend are `context.rs::open_store` and `commands/setup.rs::init`.
-- The backend comes from the locator on disk, never from a flag or an env var.
-  `--backend` exists only on `bd init`.
-- A capability (`version_control`, `remote`, `history`) may make a core command
-  *better*. It may never make one *possible*.
-
-## Exit codes
-
-This is the contract with any script or agent driving `bd`, and the reason the
-port is legible from the outside:
+## Exit codes — the contract with any script or agent driving `bd`
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | Real failure: not found, bad input, I/O, no workspace, `--readonly` refusal, bad usage. |
-| `2` | **Capability gap.** The command is built, but this workspace's backend cannot serve it (`bd branch` on SQLite). Not a bug — SQLite genuinely has no commit graph. |
-| `64` | **Not ported yet.** The command exists upstream and is registered here, but this port has not built it. |
+| `1` | Real failure: not found, bad input, I/O, no workspace, `--readonly` refusal, a `doctor` that found something. |
+| `2` | **Capability gap.** The command is built; this workspace's backend cannot serve it. `bd branch` on SQLite. Not a bug and not a to-do — SQLite genuinely has no commit graph. |
+| `64` | **Not ported yet.** Registered here, exists upstream, unbuilt. |
 
 `2` and `64` must never be conflated: one is permanent and honest, the other is a
 to-do. Under `--json` they are distinguishable without parsing prose:
 
 ```json
-{"error":"not_implemented","command":"gc","see":"PORT_STATUS.md"}
+{"error":"not_implemented","command":"cook","see":"PORT_STATUS.md"}
 {"error":"unsupported_backend","command":"branch","backend":"sqlite","requires":"dolt","capability":"version_control"}
 ```
 
-Usage errors exit `1`, not clap's default `2` — `2` is reserved for the case
-above.
-
-## Legend
-
-- **done** — implemented and exercised by tests.
-- **stub** — registered, parses, helps; exits 64.
-- **needs-dolt** — implemented as a capability probe; exits 2 on a SQLite
-  workspace with an honest message. Will work when the Dolt backend lands.
+A **missing `dolt` binary is exit 1, not 2** — the backend is perfectly capable;
+the machine is one download short. Exit 2 would tell the user to give up on
+something an install fixes.
 
 ---
 
-## Issues
+## Done
 
-| Command | Status | Notes |
-| --- | --- | --- |
-| `create` (alias `new`) | done | `-d -p -t -a -l --design --acceptance --notes --defer-until --due --deps <id:type> --estimate`. Mints the id via `store.next_id`. |
-| `q` | done | Quick capture: prints only the id, so `ID=$(bd q "...")` works. |
-| `show` (alias `view`) | done | Hydrates edges (both directions) and comments. One id → one JSON object, not a 1-element array. |
-| `update` | done | `--claim` (+`--lease`, default `claim.lease` = 1h) and every patchable field. |
-| `close` (alias `done`) | done | `--reason` is data: `conditional-blocks` edges read it. |
-| `reopen` | done | |
-| `delete` | done | |
-| `assign` | done | |
-| `unclaim` | done | `store.release_claim` |
-| `priority` | done | |
-| `label add` | done | |
-| `label remove` | done | |
-| `label list` | done | Reads `issue.labels` — the seam has no per-issue label getter. |
-| `label list-all` | done | |
-| `label propagate` | stub | |
-| `comment` | done | |
-| `comments list` | done | |
-| `comments add` | done | |
-| `edit` | stub | Needs `$EDITOR` round-tripping. |
-| `restore` | stub | |
-| `rename` | stub | |
-| `tag` | stub | |
-| `note` | stub | Append-to-notes is a read-modify-write; needs a story for the race. |
-| `defer` / `undefer` | stub | `IssuePatch` cannot express *clearing* `defer_until` (`None` means "leave alone"), so `undefer` needs a seam change. Deliberately not half-built. |
-| `duplicate` | stub | |
-| `supersede` | stub | |
-| `link` | stub | `dep add --type` covers the same ground today. |
-| `heartbeat` (alias `hb`) | stub | `store.renew_claim` is right there; the open question is what it does to `heartbeat_at`. |
-| `state` / `set-state` | stub | Custom-status workflow. |
-| `statuses` / `types` | stub | |
-| `promote` | done | Wisp → real bead. Clears `ephemeral` *and* `wisp_type` together: a bead that kept its wisp type keeps that type's TTL, and `bd gc` would reap the bead somebody just promoted. |
-| `batch` | stub | |
+**Issues** — `create` (`new`), `q`, `show`, `update`, `close`, `reopen`, `delete`,
+`edit`, `assign`, `unclaim`, `priority`, `defer`/`undefer`, `promote`, `rename`,
+`tag`, `note`, `duplicate`, `supersede`, `link`, `heartbeat`, `batch`,
+`label add|remove|list|list-all`, `comment`, `comments list|add`, `statuses`,
+`types`.
 
-## Views
+**Views** — `list`, `ready`, `blocked`, `search`, `query`, `count`, `status`,
+`history`, `where`, `children`, `epic status|close-eligible`, `info`, `stale`,
+`orphans`, `duplicates`, `find-duplicates`, `lint`, `kv`, `audit`, `context`,
+`ping`, **`diff`** (needs a commit graph → exit 2 on SQLite).
 
-| Command | Status | Notes |
-| --- | --- | --- |
-| `list` | done | Defaults to every status except closed; `--all` includes closed. |
-| `ready` | done | `--limit --priority --assignee --type --label --sort` |
-| `blocked` | done | |
-| `search` | done | Substring over title/description, pushed into SQL. |
-| `query` | done | `bd_query::parse`; uses `as_filter()` when the DB can answer alone, else `filter_hint()` + `matches()` in memory. |
-| `count` | done | |
-| `status` (alias `stats`) | done | |
-| `history` | done | The audit trail (`store.list_events`) — core, works on every backend. |
-| `where` | done | Workspace paths, backend, actor. Needs no database, which is what makes it useful when the database is the problem. |
-| `diff` | needs-dolt | Diffing refs is `HistoryViewer`; a backend with no commit graph has no refs. |
-| `children` | stub | |
-| `epic status` / `epic close-eligible` | stub | |
-| `info` | stub | |
-| `stale` | stub | |
-| `orphans` | stub | |
-| `duplicates` | stub | |
-| `find-duplicates` (alias `find-dups`) | stub | |
-| `lint` | stub | |
-| `sql` | stub | |
-| `kv set/get/clear/list` | stub | |
-| `audit record/label` | stub | |
-| `context` | stub | |
-| `ping` | stub | |
+**Deps** — `dep add|remove|list|tree|cycles|relate|unrelate`, `graph`,
+`graph check`, `recompute-blocked`.
 
-## Deps
+**Sync** — `export`, `import`, `ship`, `mail`, `repo`, **`branch`** (exit 2 on
+SQLite), `vc`, `dolt *`, and six trackers (`github`, `gitlab`, `jira`, `linear`,
+`notion`, `ado`) each with `sync|status|push|pull`. Every tracker is tested
+offline against a fake HTTP seam — **zero network calls, zero credentials.**
 
-| Command | Status | Notes |
-| --- | --- | --- |
-| `dep add` | done | `--type` (default `blocks`). |
-| `dep remove` (alias `rm`) | done | `--type` (default `blocks`), and it is **not optional in the seam**: two beads may be joined by several edges at once, so a delete keyed on the pair alone silently destroys all of them. |
-| `dep list` | done | Both directions. |
-| `dep tree` | done | ASCII tree, `--depth`. Iterative, not recursive: the graph is not guaranteed acyclic and a cycle must not blow the stack. Repeated nodes are marked, not re-expanded. |
-| `dep cycles` | done | |
-| `dep relate` / `dep unrelate` | done | `unrelate` was unwritable until `remove_dependency` took an edge type — dropping "the relation" would have dropped whatever else joined the two beads, including the edge blocking one on the other. |
-| `graph` / `graph check` | stub | |
-| `flatten` | stub | |
-| `recompute-blocked` | done | |
+**Setup** — `init` (`--backend=sqlite|dolt`), `version`, `completion`,
+`config set|get|list`, `bootstrap`, `setup`, `onboard`, `quickstart`, `prime`,
+`hooks`, `upgrade`, `metrics`.
 
-## Sync
+**Maintenance** — **`doctor`** (49 checks, 9 families, `--fix`), `preflight`,
+`gc`, `purge`, `prune`, `reclaim`, `admin cleanup`, `backup` (exit 2 on SQLite —
+it is a *Dolt* backup: branches, history, working set), `merge-slot`, `worktree`.
 
-| Command | Status | Notes |
-| --- | --- | --- |
-| `export` | done | JSONL, one object per line, `_type: "issue"` discriminator, `bd_core::Issue` field names. Re-reads each issue with `get_issue` so labels/edges/comments survive (see gaps). `-o <file>`. |
-| `import` | done | JSONL upsert, two passes so forward edge references work. Re-import is a no-op. Runs `recompute_blocked` at the end — a bulk upsert lands rows no single write path saw in order. `--dry-run`. |
-| `branch` | needs-dolt | |
-| `vc merge/commit/status` | needs-dolt | |
-| `dolt show/set/test/commit/push/pull/start/stop/status/killall/clean-databases` | needs-dolt | |
-| `dolt remote add/list/remove` | needs-dolt | |
-| `federation sync/status/add-peer/remove-peer/list-peers` | stub | |
-| `repo add/remove/list/sync` | stub | |
-| `ado`, `jira`, `linear`, `github`, `gitlab`, `notion` (each `sync/status/push/pull`) | stub | 24 leaves, one shared `TrackerCmd`. |
-| `mail` | stub | |
-| `ship` | done | `bd ship <capability> [--force] [--dry-run]`. Promotes an `export:<cap>` label to `provides:<cap>` once the work is closed. Refuses to publish over open work without `--force`: a `provides:` label is a promise other repos build against. |
+## Stubs — exit 64
 
-## Setup
-
-| Command | Status | Notes |
-| --- | --- | --- |
-| `init` | done | `--prefix` (default: derived from the directory name), `--backend` (init-only, the one place a flag may pick an engine), `--force`. Writes `.beads/config.yaml`. `--backend=dolt` exits 64. |
-| `version` | done | No workspace needed. |
-| `completion <shell>` | done | `clap_complete`; no workspace needed. |
-| `config set/get/list` | done | Store-backed. |
-| `config unset/validate/show` | stub | The seam has no config delete. |
-| `bootstrap`, `setup`, `onboard`, `quickstart`, `prime` | stub | All run without a workspace. |
-| `hooks install/uninstall/list/run` | stub | |
-| `upgrade status/review/ack` | stub | |
-| `metrics on/off/example` | stub | |
-
-## Maintenance
-
-| Command | Status |
+| Command | Blocked on |
 | --- | --- |
-| `doctor`, `preflight` | stub (run without a workspace) |
-| `gc`, `purge`, `prune`, `compact` | stub |
-| `backup status/init/sync/remove/restore` | stub |
-| `admin cleanup/compact/reset` | stub |
-| `migrate`, `rename-prefix`, `reclaim` | stub |
-| `worktree create/list/remove/info` | stub |
-| `merge-slot create/check/acquire/release` | stub |
-
-## Advanced
-
-| Command | Status |
-| --- | --- |
-| `mol bond/burn/current/distill/ready/seed/show/squash/stale/pour/wisp` | stub |
-| `formula list/show/convert/schema` | stub |
-| `cook` | stub |
-| `swarm validate/status/create/list` | stub |
-| `gate list/create/show/resolve/check` | stub |
-| `rules audit/compact` | stub |
-| `todo add/list/done` | stub |
-| `human list/respond/dismiss/stats` | stub |
-| `remember`, `memories`, `forget`, `recall` | stub |
+| `mol` (11 leaves), `swarm` (4), `gate` (5), `formula` (4), `cook`, `rules` (2) | **The formula DSL.** These all depend on it. It is a compiler — inheritance, loops, gates, aspect-oriented advice woven over a workflow graph — and it is deliberately **not** being sharded across agents. Splitting a compiler ten ways produces mush, not speed. |
+| `todo` (3), `human` (4), `remember`/`memories`/`forget`/`recall` | Nothing hard; just unbuilt. |
+| `restore`, `state`, `set-state`, `label propagate` | Custom-status workflow; the seam has the pieces. |
+| `flatten` | |
+| `compact`, `migrate`, `rename-prefix`, `admin compact`, `admin reset` | `migrate` wants `Storage::schema_version()`, which this port has no notion of. Deliberately **not** exit 2: SQLite compacts (`VACUUM`) and SQLite has a schema, so "the backend cannot" would be a lie. |
+| `config unset` / `validate` / `show` | The seam has no config *delete*. |
+| `sql` | Raw SQL cannot go through a backend-agnostic trait, and giving it one would make every other backend a liar the moment it did not speak SQLite's dialect. **The seam has no `execute_sql`, on purpose.** |
 
 ---
 
 ## Known gaps and decisions
 
-Things a future maintainer would otherwise have to rediscover:
+Things a future maintainer would otherwise rediscover the hard way.
 
-1. **`list_issues` does not hydrate relations.** Only `get_issue` returns an
-   issue's labels — the seam has no per-issue label getter at all. So
-   `bd list --json` / `bd ready --json` carry no `labels` array, while
-   `bd show --json` does. `export` pays for one `get_issue` per issue to avoid
-   shipping a lossy backup; listings deliberately do not (it would be N+1 on
-   every `bd ready`). If `bd-sqlite` starts hydrating labels in `list_issues`,
-   delete the compensation in `commands/sync.rs::export`.
-2. **`import` does not restore comments.** `add_comment` mints a new id and
-   attributes the comment to whoever is importing, so re-running an import would
-   duplicate every comment and rewrite its author. Idempotency won. The import
-   prints a warning naming the count it skipped; it does not drop them silently.
-   The real fix is a comment upsert on the seam.
-3. **The default `bd list` view enumerates statuses.** `IssueFilter` has no
-   "not closed" predicate, only a status set, so "everything except closed" is
-   spelled out as the six built-in non-closed statuses. A workspace's *custom*
-   statuses are therefore not in the default view — ask for them by name, or
-   pass `--all`.
-4. **`undefer` is a stub because `IssuePatch` cannot clear a field.** `None`
-   means "leave alone", so there is no way to express "set `defer_until` back to
-   nothing". Same reason `note` (append) is a stub. Both want a seam change, not
-   a CLI hack.
-5. **clap cannot group subcommands.** `help_heading` applies to arguments only,
-   so the family grouping in `bd --help` is rendered from the `FAMILIES` table in
-   `cli.rs`. `tests/cli.rs` asserts that table and the real command tree never
-   drift — a command added to the enum but not the table fails the build.
-6. **The binary runs on a 16 MiB worker thread.** clap's derive builds the ~120
-   subcommand tree in one enormous stack frame, which overflows Windows' 1 MiB
-   main-thread stack in a debug build. This was a real crash
-   (`STATUS_STACK_OVERFLOW`, before `main` ran), not a theoretical one. See
-   `main.rs`.
-7. **Capability probes work without an open store.** `bd branch` on a SQLite
-   workspace never opens the database: the locator is the authority on which
-   engine owns a workspace (rule 3), and `Backend::has_commit_graph()` answers
-   the question. When a store *is* open, the store's own capability accessors
-   are used instead. Same reason stubs resolve the workspace but do not open it:
-   opening a database for a command that will do nothing turns a clean exit 64
-   into a spurious exit 1.
-8. **Identity resolution order**: `--actor` > `$BEADS_ACTOR` > `.beads/config.yaml`
-   `actor` > `git config user.email` > `unknown`. It never fails — not knowing who
-   you are must not stop you from filing a bug. `$BEADS_SESSION` sets the session
-   id if present.
+1. **`is_blocked` is a denormalized cache, maintained to a *fixpoint*.** `bd ready`
+   reads the column; it does not traverse the graph. Blocked-ness propagates
+   transitively down `parent-child` edges, so a single UPDATE pass is *wrong*
+   (`bd-sqlite/src/blocked.rs` has a test proving it). **Anything that lands rows
+   without going through a local write path — a merge, a pull, an import — leaves
+   the cache stale by definition, and `bd ready` then hands out the wrong work
+   with no error, no exit code and no log line.** It is the worst failure this
+   system has and it is invisible. `bd doctor`'s `blocked-cache` check exists for
+   exactly this; it re-derives the value from the edges and diffs it against the
+   stored column, and it is mutation-tested.
+
+2. **`bd_sqlite::blocked::recompute_all` cannot converge on a `parent-child`
+   cycle.** It seeds `unmark` from the very column it is fixing, so two mutually
+   parented issues each see the other as blocked and neither unmarks — forever,
+   even after the real blocker closes. `find_cycles` reports the cycle, but
+   `recompute_blocked()` returns success while `bd ready` still lies. The doctor
+   repair re-verifies from the edges afterwards and reports failure rather than
+   lying. **Unfixed.**
+
+3. **`events.id` is an `AUTO_INCREMENT` integer.** On Dolt, two clones on separate
+   branches both allocate id N+1, and merging is a genuine key conflict between
+   rows that are not the same event. Confined to the audit trail (nothing joins
+   on an event id). The real fix is widening `bd_core::Event::id` to a `String`,
+   as `Comment::id` already was for the same reason. **Unfixed.**
+
+4. **The lock format records a pid but no hostname.** On a `.beads/` sitting on a
+   network share, a lock written by another machine gets its pid checked against
+   the *local* process table, can read as dead, and `doctor --fix` would delete a
+   lock whose owner is alive elsewhere. The doctor check is deliberately
+   conservative about this. The fix belongs in the lock *writer*: record `host=`
+   alongside `pid=`. **Unfixed.**
+
+5. **`list_issues` does not hydrate relations.** Only `get_issue` returns labels
+   and edges. So `bd list --json` carries no `labels` array while `bd show --json`
+   does. `export` pays for the hydration (a backup that loses labels is not a
+   backup); listings deliberately do not, because it would be N+1 on every
+   `bd ready`.
+
+6. **`import` restores comments by upsert, keyed on the incoming id.**
+   `add_comment` would mint a fresh id and stamp *the importer* as the author, so
+   re-importing a file would duplicate every comment and misattribute all of them.
+
+7. **The default `bd list` view enumerates statuses.** `IssueFilter` has no "not
+   closed" predicate, only a status set, so a workspace's *custom* statuses are
+   not in the default view. Ask for them by name, or pass `--all`.
+
+8. **The binary runs on a 16 MiB worker thread.** clap's derive builds the
+   ~120-subcommand tree in one enormous stack frame, which overflows Windows' 1 MiB
+   main-thread stack in a debug build. This was a real `STATUS_STACK_OVERFLOW`
+   before `main` ran, not a theoretical one.
+
+9. **Never put `install`, `setup`, `update` or `patch` in a `tests/` filename.**
+   Cargo names the test binary after the file, and Windows' installer-detection
+   heuristic auto-elevates any executable whose name contains those words. This is
+   why `wiring_cli.rs` is not called `setup_cli.rs`, and why the doctor family is
+   `runtime.rs` and not `install.rs`.
+
+10. **Capability probes work without an open store.** `bd branch` on SQLite never
+    opens the database: the locator is the authority on which engine owns a
+    workspace, and `Backend::has_commit_graph()` answers the question. Opening a
+    database for a command that will refuse anyway turns a clean exit 2 into a
+    spurious exit 1.
+
+---
+
+## Dolt: what is untested, and why
+
+The Dolt backend is **complete and unverified**. There is no `dolt` binary on the
+development machine and installing one was not authorized. Every test that needs a
+real server **skips loudly** — `"SKIPPED: this test is NOT covering anything"` —
+because a test that silently passes by doing nothing is worse than no test: it
+reports as coverage.
+
+To verify, install `dolt` and run `cargo test --workspace`. The 29 skipping tests
+will light up. In rough order of danger:
+
+1. **The merge test.** Two clones diverge, both mutate the graph, merge — and
+   `bd ready` must still be correct. Note that the *obvious* version of this test
+   cannot fail: `is_blocked` is itself a versioned column, so a branch that closes
+   a blocker has already set it correctly and the merge just carries that across.
+   The real test needs a state **neither side ever computed**: base has `A`
+   blocking `B`; one branch closes `A` (correctly setting `B` free); the other adds
+   a new open blocker `C` (correctly leaving `B` blocked). Dolt merges the cell to
+   *free*. Every local step was right and the answer is wrong. Only a full
+   `recompute_blocked()` catches it — which `merge`, `pull` and `resolve_conflicts`
+   all do, unconditionally.
+2. **`checkout` on a connection pool.** The checked-out branch is *session* state
+   in `dolt sql-server`. The pool is pinned to **one** connection for this reason;
+   with more, a write could land on a sibling connection still on the old branch —
+   silently writing issues to the wrong branch. Verify the pin actually holds.
+3. **Does Dolt accept the DDL at all** — `DATETIME(6)`, `COLLATE=utf8mb4_0900_bin`,
+   table-level FKs with `ON DELETE CASCADE`, inline `KEY`, `AUTO_INCREMENT`.
+4. **`WITH RECURSIVE` inside an `IN (…)` subquery** (the `--parent` transitive
+   filter) — the highest-risk untested query.
+5. **The fixpoint, end to end.** MySQL rejects `UPDATE t … WHERE EXISTS (SELECT …
+   FROM t)` (error 1093), which is exactly the shape of the SQLite fixpoint, so it
+   was rewritten as select-then-update-by-id. Verified as *generated SQL*, never as
+   behaviour.
+6. **`a_recompute_never_bumps_updated_at`** — the merge-conflict-prevention
+   invariant. Asserted statically today; the runtime assertion has never run.
