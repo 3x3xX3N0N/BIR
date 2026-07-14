@@ -506,7 +506,11 @@ pub enum Commands {
 
     // ===================== Maintenance =====================
     /// Diagnose the workspace
-    Doctor,
+    Doctor {
+        /// Repair what can be repaired automatically
+        #[arg(long)]
+        fix: bool,
+    },
     /// Check that everything needed is present
     Preflight,
     /// Collect garbage (expired wisps, lapsed leases)
@@ -629,8 +633,8 @@ impl Commands {
         use Commands::*;
         match self {
             // Run before, or without, a workspace.
-            Init(_) | Version | Completion { .. } | Quickstart | Doctor | Preflight | Onboard
-            | Setup { .. } | Bootstrap => Need::Nothing,
+            Init(_) | Version | Completion { .. } | Quickstart | Doctor { .. } | Preflight
+            | Onboard | Setup { .. } | Bootstrap => Need::Nothing,
 
             _ => Need::Workspace,
         }

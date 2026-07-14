@@ -47,10 +47,8 @@ use crate::commands::{Cap, require_cap, stub};
 use crate::context::Ctx;
 use crate::exit::{self, SilentExit};
 
-/// Wave 4 owns the doctor checks; this stays a stub until the registry lands.
-pub async fn doctor(ctx: &Ctx) -> Result<()> {
-    stub("doctor", ctx)
-}
+// `doctor` lives in `crate::doctor` — it is a registry of checks, not a command
+// body, and it is big enough to be its own module.
 
 // ---------------------------------------------------------------------------
 // preflight

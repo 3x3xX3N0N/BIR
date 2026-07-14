@@ -224,7 +224,7 @@ pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
         C::Completion { shell } => setup::completion(shell),
 
         // ----- Maintenance -----
-        C::Doctor => maintenance::doctor(ctx).await,
+        C::Doctor { fix } => crate::doctor::run(ctx, crate::doctor::Opts { fix }).await,
         C::Preflight => maintenance::preflight(ctx).await,
         C::Gc { dry_run } => maintenance::gc(ctx, dry_run).await,
         C::Purge {

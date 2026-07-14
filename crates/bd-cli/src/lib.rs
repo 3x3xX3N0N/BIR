@@ -10,6 +10,7 @@
 pub mod cli;
 pub mod commands;
 pub mod context;
+pub mod doctor;
 pub mod exit;
 pub mod integrations;
 pub mod output;

@@ -50,6 +50,16 @@ pub struct Ctx {
     pub config: Config,
     pub out: Out,
     pub readonly: bool,
+    /// The `.beads` directory we found, **even if nothing in it would load**.
+    ///
+    /// `locator` is `None` in two very different situations — there is no
+    /// workspace, and there is a workspace whose `workspace.json` is corrupt —
+    /// and `bd doctor` exists to tell them apart.
+    pub beads_dir: Option<PathBuf>,
+    /// Why the locator would not load. `Some` only under [`Need::Nothing`].
+    pub locator_error: Option<String>,
+    /// Why `config.yaml` would not parse. `Some` only under [`Need::Nothing`].
+    pub config_error: Option<String>,
     /// Opened on first [`Ctx::store`], at most once.
     store: OnceCell<Box<dyn Storage>>,
 }
@@ -70,10 +80,31 @@ impl Ctx {
             Some(p) => Some(beads_dir_for_db(p)?),
             None => Locator::discover(&cwd),
         };
-        let locator = match beads_dir {
-            Some(dir) => Some(Locator::load(&dir).with_context(|| {
-                format!("cannot read the workspace at {}", dir.display())
-            })?),
+        // A workspace whose locator will not load is a *fault to diagnose*, not a
+        // reason to refuse to exist — but only for the commands that run without
+        // a workspace at all. `bd close` on a corrupt workspace must still fail
+        // loudly; `bd doctor` on one must still run, because that is the entire
+        // reason `bd doctor` exists.
+        //
+        // This was wrong for one wave, and four separate agents reported it
+        // independently: `bd doctor` on a workspace with a corrupt
+        // `workspace.json` printed "cannot read the workspace" and ran ZERO
+        // checks — on precisely the input the command is for.
+        let mut locator_error = None;
+        let mut config_error = None;
+
+        let locator = match &beads_dir {
+            Some(dir) => match Locator::load(dir) {
+                Ok(l) => Some(l),
+                Err(e) if need == Need::Nothing => {
+                    locator_error = Some(format!("{e:#}"));
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("cannot read the workspace at {}", dir.display())));
+                }
+            },
             None => None,
         };
         if locator.is_none() && need != Need::Nothing {
@@ -81,8 +112,19 @@ impl Ctx {
         }
 
         // 5. Config, before identity: it can supply a default actor.
-        let config = match &locator {
-            Some(l) => Config::load(&l.dir)?,
+        //
+        // Same rule. A single typo in `.beads/config.yaml` used to stop `bd
+        // doctor` from starting — which is absurd, since a malformed config is
+        // exactly the sort of thing you run the doctor to find.
+        let config = match beads_dir.as_deref() {
+            Some(dir) => match Config::load(dir) {
+                Ok(c) => c,
+                Err(e) if need == Need::Nothing => {
+                    config_error = Some(format!("{e:#}"));
+                    Config::default()
+                }
+                Err(e) => return Err(e),
+            },
             None => Config::default(),
         };
 
@@ -110,6 +152,9 @@ impl Ctx {
             config,
             out,
             readonly: cli.readonly,
+            beads_dir,
+            locator_error,
+            config_error,
             store: OnceCell::new(),
         })
     }
