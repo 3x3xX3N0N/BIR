@@ -251,7 +251,7 @@ pub async fn branch(ctx: &Ctx, name: Option<String>) -> Result<()> {
         Some(name) => {
             ctx.ensure_writable("switch branches")?;
             let existing = vc.list_branches().await?;
-            let created = !existing.iter().any(|b| *b == name);
+            let created = !existing.contains(&name);
             if created {
                 vc.create_branch(&name).await?;
             }

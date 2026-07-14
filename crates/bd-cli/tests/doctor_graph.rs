@@ -16,11 +16,29 @@
 //! that asserted on the run's *overall* verdict would be asserting on eight other
 //! people's checks, and would break every time one of them landed. Everything
 //! below addresses a check by name.
+//!
+//! # Why one of these tests writes SQL
+//!
+//! The check that justifies this whole family — `blocked-cache` — cannot be
+//! tripped through the CLI at all, and that is a *compliment* to the store: every
+//! write path recomputes `is_blocked` to a fixpoint, `bd import` recomputes,
+//! `add_dependency` refuses a cycle before writing, and foreign keys are on. The
+//! stale cache it guards against therefore never arrives through `bd`. It arrives
+//! from a second writer — a merge, a pull, another beads implementation — landing
+//! rows in the table without going through any of that.
+//!
+//! So the one test that matters most reaches *behind* the store and corrupts the
+//! database the way a merge corrupts it: real bytes, on real disk, under a real
+//! `bd doctor`. It could have been written by injecting the staleness as data and
+//! comparing two sets in-process, but that would have tested the comparison and
+//! not the command — and this is precisely the check where a test that reports as
+//! coverage without exercising the thing is worse than no test.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -100,6 +118,84 @@ impl Ws {
     fn close(&self, id: &str, reason: &str) {
         self.ok(&["close", id, "--reason", reason]);
     }
+
+    /// The ids the *stored cache* currently says are blocked.
+    ///
+    /// `bd blocked` filters on `is_blocked = 1` and does not walk the graph, so
+    /// this is the column itself, read back through the front door — the same
+    /// answer `bd ready` is inverting to decide what to hand an agent.
+    #[track_caller]
+    fn blocked(&self) -> Vec<String> {
+        ids(&self.ok(&["blocked", "--limit", "0", "--json"]))
+    }
+
+    #[track_caller]
+    fn ready(&self) -> Vec<String> {
+        ids(&self.ok(&["ready", "--limit", "0", "--json"]))
+    }
+
+    /// Write straight into `.beads/beads.db`, **behind the store's back**.
+    ///
+    /// This is the only way to produce the input `blocked-cache` exists for. Every
+    /// write path in this port recomputes `is_blocked` to a fixpoint, so the
+    /// front door cannot leave a stale cache behind however hard it is pushed. A
+    /// merge can, an import from another implementation can, a hand-edited
+    /// database can — none of which go through `Storage` at all. This call is that
+    /// second writer.
+    ///
+    /// The pool is opened, used and **closed** inside this call. The store caps
+    /// itself at one connection because a second concurrent write transaction in
+    /// WAL mode fails immediately with `SQLITE_BUSY_SNAPSHOT`, which
+    /// `busy_timeout` does not retry — so a test still holding a write connection
+    /// when it shells out to `bd` would be measuring that, not the check.
+    ///
+    /// Returns the rows each statement actually touched. A corruption that
+    /// silently matched nothing would make everything below a green test that
+    /// proves nothing, which is the exact failure this file is here to stop.
+    #[track_caller]
+    fn behind_the_stores_back(&self, statements: &[String]) -> Vec<u64> {
+        let db = self.dir.join(".beads").join("beads.db");
+        assert!(db.exists(), "no database at {}", db.display());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to reach the database with");
+
+        rt.block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(SqliteConnectOptions::new().filename(&db).foreign_keys(true))
+                .await
+                .expect("open the workspace database directly");
+
+            let mut affected = Vec::new();
+            for sql in statements {
+                let n = sqlx::query(sql)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+                    .rows_affected();
+                affected.push(n);
+            }
+
+            // Before `bd` runs again, and not a line later.
+            pool.close().await;
+            affected
+        })
+    }
+}
+
+fn ids(json: &str) -> Vec<String> {
+    let v: Value = serde_json::from_str(json).expect("a list command must emit JSON");
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("a list command must emit a JSON array")
+        .iter()
+        .map(|i| i["id"].as_str().expect("every issue has an id").to_string())
+        .collect();
+    out.sort();
+    out
 }
 
 impl Drop for Ws {
@@ -314,6 +410,150 @@ fn fix_does_not_claim_to_have_repaired_a_healthy_cache() {
     // And nothing it did while other families were repairing broke the cache.
     let recompute: Value = serde_json::from_str(&ws.ok(&["recompute-blocked", "--json"])).unwrap();
     assert_eq!(recompute["updated"], 0);
+}
+
+/// **The test the whole family exists for, end to end, on real bytes.**
+///
+/// A merge, a pull, or another beads implementation lands rows in `issues` and
+/// `dependencies` without going through a write path, so `is_blocked` keeps
+/// whatever it happened to have. Nothing crashes. Nothing logs. Every command
+/// still exits 0. `bd ready` simply starts giving the wrong answer.
+///
+/// That state is unreachable through the CLI — every write path recomputes the
+/// cache to a fixpoint — so this test *is* the second writer: it opens the real
+/// `.beads/beads.db` and flips two rows of the cache, in the two opposite
+/// directions the bug has.
+///
+/// * The deep child is genuinely blocked — three levels of `parent-child`
+///   propagation up to a blocker that is still open — and the cache is made to
+///   say **free**. `bd ready` hands an agent work whose blocker is open.
+/// * The blocker itself is genuinely free, and the cache is made to say
+///   **blocked**. `bd ready` hides claimable work.
+///
+/// The first of those two is also what keeps the derivation honest: a check that
+/// had quietly stopped propagating blocked-ness down the containment tree would
+/// compute the deep child as free, *agree* with the corrupted cache, and report
+/// this workspace as healthy.
+///
+/// Then `--fix` has to actually mend it — and a fresh `bd doctor`, in a fresh
+/// process, has to find nothing left to say.
+#[test]
+fn a_cache_stale_the_way_a_merge_leaves_it_is_caught_in_both_directions_and_repaired() {
+    let ws = Ws::new("stale-cache");
+    let (blocker, deep_child) = build_everything(&ws);
+
+    // Ground truth first. Without this the test could "pass" against a check that
+    // reports staleness on every workspace, or against a `bd ready` that was
+    // already wrong before anything was corrupted.
+    assert!(
+        ws.blocked().contains(&deep_child),
+        "the deep child is gated three levels up; if the cache does not say so, \
+         the corruption below is not a corruption"
+    );
+    assert!(ws.ready().contains(&blocker), "the blocker is claimable");
+    assert!(!ws.ready().contains(&deep_child));
+    assert_eq!(status(&ws.doctor(&[]), "blocked-cache"), "ok");
+
+    // The merge lands. It carried the edges; it did not carry the fixpoint.
+    //
+    // The `AND is_blocked = <the opposite>` guard is what makes the row counts
+    // below mean something: each UPDATE matches only if the stored value really
+    // was the truthful one it is about to destroy.
+    let touched = ws.behind_the_stores_back(&[
+        format!("UPDATE issues SET is_blocked = 0 WHERE id = '{deep_child}' AND is_blocked = 1"),
+        format!("UPDATE issues SET is_blocked = 1 WHERE id = '{blocker}' AND is_blocked = 0"),
+    ]);
+    assert_eq!(
+        touched,
+        vec![1, 1],
+        "the cache was not corrupted — the rows already held what was written to \
+         them, so everything below would be asserting about a healthy workspace"
+    );
+
+    // The harm, observed from outside the process. This is the failure in the
+    // flesh: no error, no exit code, no log line, and `bd ready` is now handing
+    // out a bead whose blocker is still open while hiding one that is claimable.
+    assert!(
+        ws.ready().contains(&deep_child),
+        "a stale cache must make `bd ready` hand out blocked work — if it does \
+         not, this test is not reproducing the bug it claims to"
+    );
+    assert!(!ws.ready().contains(&blocker), "…and hide free work");
+    assert!(ws.blocked().contains(&blocker));
+    assert!(!ws.blocked().contains(&deep_child));
+
+    // Doctor is the only thing in the program that notices.
+    let doc = ws.doctor(&[]);
+    assert_eq!(
+        status(&doc, "blocked-cache"),
+        "error",
+        "a lying `bd ready` is not untidiness: {:#}",
+        check(&doc, "blocked-cache")
+    );
+
+    // And it must *name* the beads, on the correct side. "2 issues are corrupt"
+    // is a bug report nobody can act on, and naming them on the wrong side sends
+    // the reader to look for a blocker that isn't there.
+    let d = detail(&doc, "blocked-cache");
+    let offered = d
+        .lines()
+        .find(|l| l.contains("offering"))
+        .unwrap_or_else(|| panic!("the finding never says which beads are being handed out:\n{d}"));
+    assert!(
+        offered.contains(&deep_child) && !offered.contains(&blocker),
+        "the bead `bd ready` is wrongly offering is {deep_child}: {offered}"
+    );
+    let hidden = d
+        .lines()
+        .find(|l| l.contains("hiding"))
+        .unwrap_or_else(|| panic!("the finding never says which beads are being hidden:\n{d}"));
+    assert!(
+        hidden.contains(&blocker) && !hidden.contains(&deep_child),
+        "the bead `bd ready` is wrongly hiding is {blocker}: {hidden}"
+    );
+
+    // -- and now mend it ----------------------------------------------------
+
+    let doc = ws.doctor(&["--fix"]);
+    let repair = doc["repairs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r["check"] == "blocked-cache")
+        .unwrap_or_else(|| panic!("`--fix` did not even try to repair the cache:\n{doc:#}"));
+    assert_eq!(
+        repair["outcome"], "fixed",
+        "the one repair in this program that is always safe did not happen: {repair:#}"
+    );
+
+    // Doctor re-runs its checks after a repair, so the report it printed must
+    // already describe the mended workspace — otherwise `bd doctor --fix` in a
+    // hook fixes the problem and fails the build anyway.
+    assert_eq!(
+        status(&doc, "blocked-cache"),
+        "ok",
+        "--fix reported the pre-repair finding: {:#}",
+        check(&doc, "blocked-cache")
+    );
+
+    // A fresh process, reading the file back off disk: the repair was durable,
+    // and the store agrees from the other side that the cache is at the fixpoint.
+    assert_eq!(status(&ws.doctor(&[]), "blocked-cache"), "ok");
+    let recompute: Value = serde_json::from_str(&ws.ok(&["recompute-blocked", "--json"])).unwrap();
+    assert_eq!(
+        recompute["updated"], 0,
+        "doctor said the cache was mended and the store says it is still stale"
+    );
+
+    // The thing that was actually broken is the thing that works again.
+    assert!(
+        !ws.ready().contains(&deep_child),
+        "`bd ready` is still handing out blocked work after --fix"
+    );
+    assert!(ws.ready().contains(&blocker));
+    assert!(ws.blocked().contains(&deep_child));
+    assert!(!ws.blocked().contains(&blocker));
 }
 
 // ---------------------------------------------------------------------------

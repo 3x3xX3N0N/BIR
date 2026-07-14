@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -101,6 +102,59 @@ impl Ws {
     #[track_caller]
     fn blocked(&self) -> Vec<String> {
         ids(&self.json(&["blocked", "--limit", "0"]))
+    }
+
+    /// Write straight into `.beads/beads.db`, **behind the store's back**.
+    ///
+    /// There is no front door to a corrupt graph in this port, and that is not an
+    /// oversight: `add_dependency` refuses a cycle *before* it writes, foreign
+    /// keys are on so no edge can point at a bead that does not exist, and every
+    /// write path recomputes `is_blocked` to a fixpoint. So the corruption
+    /// `bd graph check` and `bd doctor` exist for never arrives through `bd` at
+    /// all — it arrives from a *second writer*: a merge, a pull, an import, a
+    /// hand-edited database, another beads implementation writing the same
+    /// tables. This is that second writer, and it is the only way to test the
+    /// checks that guard against it without faking their input.
+    ///
+    /// The pool is opened, used and **closed** inside this call. The store caps
+    /// itself at one connection because a second concurrent write transaction in
+    /// WAL mode fails immediately with `SQLITE_BUSY_SNAPSHOT`, which
+    /// `busy_timeout` does not retry — so a test still holding a write connection
+    /// when it shells out to `bd` would be measuring that, not the check.
+    ///
+    /// Returns the rows each statement actually touched, because a corruption
+    /// that silently affected nothing is a green test that proves nothing.
+    #[track_caller]
+    fn behind_the_stores_back(&self, statements: &[String]) -> Vec<u64> {
+        let db = self.dir.join(".beads").join("beads.db");
+        assert!(db.exists(), "no database at {}", db.display());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to reach the database with");
+
+        rt.block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(SqliteConnectOptions::new().filename(&db).foreign_keys(true))
+                .await
+                .expect("open the workspace database directly");
+
+            let mut affected = Vec::new();
+            for sql in statements {
+                let n = sqlx::query(sql)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+                    .rows_affected();
+                affected.push(n);
+            }
+
+            // Before `bd` runs again, and not a line later.
+            pool.close().await;
+            affected
+        })
     }
 }
 
@@ -632,6 +686,13 @@ fn graph_check_passes_on_a_sound_graph() {
 /// The write path cannot produce a cycle, so this reaches around it and writes
 /// one directly — which is exactly how a cycle really arrives: an import, a
 /// merge, or another beads implementation. `bd graph check` exists to notice.
+///
+/// Note the order of the two halves. First the front door is asked for a cycle
+/// and *refuses*, which is what makes the second half meaningful: the row that
+/// follows could not have got there through `bd`, so what is being tested is the
+/// check, not the writer. Then the same edge is written by a second writer, the
+/// way a merge writes it, and `bd graph check` has to find what `bd dep add`
+/// would never have allowed.
 #[test]
 fn graph_check_finds_a_cycle_written_behind_the_stores_back() {
     let ws = Ws::new("corrupt");
@@ -639,25 +700,31 @@ fn graph_check_finds_a_cycle_written_behind_the_stores_back() {
     let b = ws.q("B");
     ws.dep(&b, &a, "blocks");
 
-    // `bd sql` is the only back door past the write path's cycle check. It is a
-    // stub today (someone else's file), so this test cannot yet corrupt anything
-    // — and it says so rather than reporting a false green. It will start
-    // asserting for real the moment `bd sql` can write.
-    ws.run(&[
-        "sql",
-        &format!(
-            "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) \
-             VALUES ('{a}', '{b}', 'blocks', '2020-01-01T00:00:00+00:00')"
-        ),
-    ]);
-    if ws.json(&["dep", "cycles"]).as_array().unwrap().is_empty() {
-        eprintln!(
-            "SKIPPED graph_check_finds_a_cycle_written_behind_the_stores_back: \
-             `bd sql` cannot write, so there is no way to plant a cycle from out here. \
-             The check's own logic is covered by the unit tests in commands::deps."
-        );
-        return;
-    }
+    // The front door refuses to close the loop, and leaves nothing behind.
+    let (_, stderr, code) = ws.run(&["dep", "add", &a, &b, "--type", "blocks"]);
+    assert_eq!(code, 1, "the write path must still refuse a cycle: {stderr}");
+    assert!(
+        ws.json(&["dep", "cycles"]).as_array().unwrap().is_empty(),
+        "a refused edge must not be in the graph — there is nothing to detect yet"
+    );
+
+    // So somebody else writes it. `created_at` is in the store's own encoding:
+    // RFC-3339 with an explicit offset, which is what sqlx's `DateTime<Utc>`
+    // decoder will be asked to read back.
+    let touched = ws.behind_the_stores_back(&[format!(
+        "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) \
+         VALUES ('{a}', '{b}', 'blocks', '2020-01-01T00:00:00+00:00')"
+    )]);
+    assert_eq!(touched, vec![1], "the cycle was never planted");
+
+    // It really is a cycle, and the store's own detector — the same one the write
+    // path enforces with — is the thing that says so.
+    let cycles = ws.json(&["dep", "cycles"]);
+    assert_eq!(
+        cycles.as_array().unwrap().len(),
+        1,
+        "a → b → a is a cycle and `bd dep cycles` did not see it: {cycles}"
+    );
 
     let (stdout, _, code) = ws.run(&["graph", "check"]);
     assert_eq!(
@@ -665,8 +732,14 @@ fn graph_check_finds_a_cycle_written_behind_the_stores_back() {
         "a corrupt graph is a real failure, not a clean report: {stdout}"
     );
     assert!(stdout.to_lowercase().contains("cycle"), "{stdout}");
+    assert!(stdout.contains(&a) && stdout.contains(&b), "{stdout}");
 
-    let doc = ws.json(&["graph", "check"]);
+    // `ws.json` asserts exit 0, and this command is *supposed* to fail. It still
+    // owes an agent a parseable answer.
+    let (stdout, stderr, code) = ws.run(&["graph", "check", "--json"]);
+    assert_eq!(code, 1, "{stderr}");
+    let doc: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("a failing --json check must still emit JSON ({e}): {stdout}"));
     assert_eq!(doc["ok"], false);
     let cycles = doc["cycles"].as_array().unwrap();
     assert_eq!(cycles.len(), 1, "{doc}");
@@ -675,6 +748,24 @@ fn graph_check_finds_a_cycle_written_behind_the_stores_back() {
         cycle.first(),
         cycle.last(),
         "a cycle is reported as a path that closes on itself: {doc}"
+    );
+
+    // And doctor is not a second opinion that disagrees with the first: the same
+    // corruption has to be an *error* there too, or a hook that runs `bd doctor`
+    // passes over a graph `bd graph check` is exiting 1 on.
+    let (stdout, _, _) = ws.run(&["doctor", "--json"]);
+    let doc: Value = serde_json::from_str(&stdout).expect("`bd doctor --json` emits JSON");
+    let cyc = doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "dependency-cycles")
+        .expect("`dependency-cycles` is registered");
+    assert_eq!(cyc["status"], "error", "{cyc:#}");
+    let detail = cyc["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains(&a) && detail.contains(&b),
+        "the cycle must be named, not counted: {detail}"
     );
 }
 

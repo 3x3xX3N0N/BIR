@@ -881,12 +881,12 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             //
             // So write both, and keep them in step. The store copy is what
             // another beads implementation reads; the yaml is what this one does.
-            if key == "issue.prefix" || key == "prefix" {
-                if let Some(dir) = &ctx.beads_dir {
-                    let mut config = ctx.config.clone();
-                    config.prefix = Some(value.clone());
-                    config.save(dir)?;
-                }
+            if (key == "issue.prefix" || key == "prefix")
+                && let Some(dir) = &ctx.beads_dir
+            {
+                let mut config = ctx.config.clone();
+                config.prefix = Some(value.clone());
+                config.save(dir)?;
             }
 
             if ctx.out.is_json() {
