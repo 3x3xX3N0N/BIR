@@ -101,6 +101,18 @@ pub struct IssueFilter {
     pub spec_id: Option<String>,
     pub has_metadata_key: Option<String>,
 
+    /// The two halves of the tracker join key.
+    ///
+    /// Together they are how a sync tells "the issue I already have" from "a new
+    /// one". Without them every tracker had to scan the whole workspace and index
+    /// it in memory to answer a question the database can answer directly:
+    /// `source_system = 'jira' AND external_ref = 'PROJ-12'`.
+    ///
+    /// `source_system` matches `''` like any other value — that is a real query
+    /// ("beads no tracker owns"), not a wildcard.
+    pub source_system: Option<String>,
+    pub external_ref: Option<String>,
+
     pub created_after: Option<DateTime<Utc>>,
     pub created_before: Option<DateTime<Utc>>,
     pub updated_after: Option<DateTime<Utc>>,

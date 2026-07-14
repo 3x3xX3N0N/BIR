@@ -705,15 +705,12 @@ impl Tracker for Notion {
         let props = Props::load(store).await?;
         let prefix = ctx.prefix().await;
 
-        // The join key, built once. `IssueFilter` cannot express
-        // "external_ref = ?", so this is a scan of the workspace — see the note
-        // in the report about the seam this wants.
-        let local = store.list_issues(&IssueFilter::default()).await?;
+        // The join key, built once — and half of it is now a filter the database
+        // answers, so this lists the beads Notion owns rather than the workspace.
+        let local = store.list_issues(&ours()).await?;
         let mut by_page: HashMap<String, String> = HashMap::new();
         for i in &local {
-            if i.source_system == self.name()
-                && let Some(r) = &i.external_ref
-            {
+            if let Some(r) = &i.external_ref {
                 by_page.insert(r.clone(), i.id.clone());
             }
         }
@@ -847,16 +844,39 @@ impl Tracker for Notion {
         let schema = self.schema(http, &token, &db).await?;
 
         let local = store.list_issues(&IssueFilter::default()).await?;
-        let mine: Vec<&Issue> = local
-            .iter()
-            .filter(|i| i.source_system == self.name())
-            .collect();
+        let mut notes: Vec<String> = Vec::new();
+        let mut mine: Vec<&Issue> = Vec::new();
+        for i in &local {
+            // Beads Notion already owns, plus locally-authored ones that belong
+            // to no tracker yet. The second group is new: push could not create a
+            // page for them while `IssuePatch` had no `source_system`, because a
+            // page beads cannot claim afterwards is a duplicate on the next pull.
+            // It can claim them now, so it files them.
+            if i.source_system == self.name() {
+                mine.push(i);
+            } else if i.source_system.is_empty() {
+                if i.ephemeral || i.is_template || i.issue_type.excluded_from_ready() {
+                    continue; // beads' own plumbing; nobody's Notion page
+                }
+                // A ref with no system is somebody's hand edit pointing at a
+                // tracker we cannot name. Creating a page for it would file work
+                // that already exists elsewhere.
+                if let Some(r) = &i.external_ref {
+                    notes.push(format!(
+                        "{}: external_ref `{r}` has no source_system — not assumed to be notion",
+                        i.id
+                    ));
+                    continue;
+                }
+                mine.push(i);
+            }
+        }
+
         let ids: Vec<String> = mine.iter().map(|i| i.id.clone()).collect();
         let labels: HashMap<String, Vec<String>> =
             store.labels_of(&ids).await?.into_iter().collect();
 
         let mut report = SyncReport::default();
-        let mut notes: Vec<String> = Vec::new();
 
         for issue in mine {
             let ls = labels.get(&issue.id).map(Vec::as_slice).unwrap_or(&[]);
@@ -884,35 +904,20 @@ impl Tracker for Notion {
                         .send(request(Method::Post, &url, &token, Some(body)))
                         .await?;
                     let created: CreatedPage = resp.json()?;
-                    // Record the link immediately. An issue whose page exists but
-                    // whose external_ref does not is a duplicate on the next pull.
+                    // Claim the page immediately, with **both** halves of the join
+                    // key. A page whose id beads did not record is a duplicate on
+                    // the next pull; a page recorded without its `source_system`
+                    // is a page the next pull does not recognize as ours, which is
+                    // the same duplicate by a longer road.
                     let patch = IssuePatch {
                         external_ref: Field::Set(created.id),
+                        source_system: Field::Set(self.name().to_string()),
                         ..Default::default()
                     };
                     store.update_issue(&issue.id, &patch).await?;
                 }
             }
             report.pushed += 1;
-        }
-
-        // The honest limit of push, stated rather than papered over.
-        //
-        // A locally-authored bead has `source_system = ""`. Creating a page for
-        // it would require stamping `source_system = "notion"` back onto the
-        // existing issue — and `IssuePatch` has no `source_system` field, so
-        // there is no way to. Push it anyway and the next pull, which joins on
-        // (external_ref, source_system), would not recognize the page and would
-        // create a *second* bead for it. Every sync thereafter would do it again.
-        // So: not pushed, and said out loud. See the report — this wants
-        // `IssuePatch { source_system: Field<String> }` on the storage seam.
-        let unlinked = local.iter().filter(|i| i.source_system.is_empty()).count();
-        if unlinked > 0 {
-            notes.push(format!(
-                "{unlinked} local issue(s) have no notion page and were not created: the store \
-                 cannot record `source_system` on an existing issue (IssuePatch has no such \
-                 field), and a page beads cannot claim is a duplicate on the next pull"
-            ));
         }
 
         notes.sort();
@@ -924,6 +929,14 @@ impl Tracker for Notion {
 
 fn default_priority(ctx: &Ctx) -> Priority {
     Priority::new(ctx.config.defaults.priority).unwrap_or_default()
+}
+
+/// The beads Notion owns — half the join key, asked of the database.
+fn ours() -> IssueFilter {
+    IssueFilter {
+        source_system: Some("notion".to_string()),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

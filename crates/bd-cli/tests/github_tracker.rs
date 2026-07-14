@@ -15,7 +15,7 @@ use std::process::Command;
 
 use bd_cli::cli::Cli;
 use bd_cli::context::{Ctx, Need};
-use bd_cli::integrations::github::{self, GitHub, MARKER_LABEL, PER_PAGE};
+use bd_cli::integrations::github::{self, GitHub, PER_PAGE};
 use bd_cli::integrations::http::{FakeHttp, Method};
 use bd_cli::integrations::Tracker;
 use bd_core::{Issue, IssueFilter, IssueType, Priority, Status};
@@ -313,18 +313,18 @@ async fn pagination_is_followed_to_the_last_page() {
 // Push
 // ---------------------------------------------------------------------------
 
-/// A local bead marked for GitHub is created there, and the remote number is
-/// written back *immediately* — a bead that forgets the issue it just made will
-/// make it again on the next push.
+/// A local bead is created on GitHub, and the remote number is written back
+/// *immediately* — a bead that forgets the issue it just made will make it again
+/// on the next push.
 #[tokio::test]
-async fn push_creates_a_marked_bead_and_records_the_remote_number() {
+async fn push_creates_a_local_bead_and_records_the_remote_number() {
     let ctx = workspace("push-new").await;
     let store = ctx.store().await.unwrap();
     let id = store.next_id("t", "ship the thing", "").await.unwrap();
     store
         .create_issue(&Issue {
             description: "please".into(),
-            labels: vec![MARKER_LABEL.to_string(), "urgent".to_string()],
+            labels: vec!["urgent".to_string()],
             ..Issue::new(&id, "ship the thing")
         })
         .await
@@ -341,30 +341,29 @@ async fn push_creates_a_marked_bead_and_records_the_remote_number() {
     assert_eq!(body["title"], "ship the thing");
     assert_eq!(body["body"], "please");
     assert_eq!(body["state"], "open");
-    assert_eq!(
-        body["labels"],
-        json!(["urgent"]),
-        "the `github` marker is beads' bookkeeping and must not be pushed into someone's repo"
-    );
+    assert_eq!(body["labels"], json!(["urgent"]));
 
+    // Both halves of the join key, stamped on the bead push just filed. The ref
+    // alone would leave a bead the next pull does not recognize as GitHub's.
     let bead = store.get_issue(&id).await.unwrap().unwrap();
     assert_eq!(bead.external_ref.as_deref(), Some("42"));
+    assert_eq!(
+        bead.source_system, "github",
+        "push must stamp the system half of the key, or the next pull duplicates this bead"
+    );
 }
 
-/// The round trip that duplicates the backlog if the marker is not honored: push
-/// creates issue 42, then a pull sees 42 come back. The bead we just created has
-/// no `source_system` (there is no `IssuePatch` field for one), so it is found by
-/// its marker label — or it is found not at all and inserted a second time.
+/// The round trip that duplicates the backlog if the join key is not written in
+/// full: push creates issue 42, then a pull sees 42 come back. The bead push just
+/// created is found by (source_system, external_ref) — or it is found not at all
+/// and inserted a second time, forever, on every sync.
 #[tokio::test]
 async fn a_pushed_bead_is_not_duplicated_by_the_next_pull() {
     let ctx = workspace("roundtrip").await;
     let store = ctx.store().await.unwrap();
     let id = store.next_id("t", "local work", "").await.unwrap();
     store
-        .create_issue(&Issue {
-            labels: vec![MARKER_LABEL.to_string()],
-            ..Issue::new(&id, "local work")
-        })
+        .create_issue(&Issue::new(&id, "local work"))
         .await
         .unwrap();
 
@@ -389,9 +388,39 @@ async fn a_pushed_bead_is_not_duplicated_by_the_next_pull() {
     );
     assert_eq!(all_issues(&ctx).await.len(), 1);
 
-    // And the marker survives the pull, or the *next* round trip duplicates it.
+    // And the key survives the pull, or the *next* round trip duplicates it.
     let bead = store.get_issue(&id).await.unwrap().unwrap();
-    assert!(bead.labels.iter().any(|l| l == MARKER_LABEL));
+    assert_eq!(bead.source_system, "github");
+    assert_eq!(bead.external_ref.as_deref(), Some("42"));
+}
+
+/// A bead bound to a ref that names no system is not adopted. GitHub issue 42 and
+/// ADO work item 42 are both the bare string "42": guessing from the shape of a
+/// ref is how a tracker walks into another tracker's bead.
+#[tokio::test]
+async fn push_declines_a_bead_whose_ref_names_no_system() {
+    let ctx = workspace("push-unstamped").await;
+    let store = ctx.store().await.unwrap();
+    let id = store.next_id("t", "who owns this", "").await.unwrap();
+    store
+        .create_issue(&Issue {
+            external_ref: Some("42".into()),
+            ..Issue::new(&id, "who owns this")
+        })
+        .await
+        .unwrap();
+
+    // Any request at all would be a bug, and FakeHttp fails on an unstubbed one.
+    let http = FakeHttp::new();
+    let report = GitHub.push(&ctx, &http).await.unwrap();
+
+    assert_eq!(report.pushed, 0);
+    assert!(http.requests().is_empty(), "issue 42 was PATCHed on a guess");
+    assert!(
+        report.skipped.iter().any(|s| s.contains("source_system")),
+        "the skip must say why: {:?}",
+        report.skipped
+    );
 }
 
 #[tokio::test]
@@ -440,7 +469,9 @@ async fn push_declines_a_bead_owned_by_another_tracker() {
         .create_issue(&Issue {
             source_system: "jira".into(),
             external_ref: Some("PROJ-9".into()),
-            labels: vec![MARKER_LABEL.to_string()],
+            // A `github` label is now just a label. Ownership is the
+            // `source_system` field, and this bead's says jira.
+            labels: vec!["github".to_string()],
             ..Issue::new(&id, "jira's issue")
         })
         .await

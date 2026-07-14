@@ -233,9 +233,11 @@ impl Tracker for Jira {
         let remote = self.search(&conf, http).await?;
 
         // The join key, built once: (source_system, external_ref) -> local id.
-        // Without this every pull re-creates the whole backlog.
-        let local = store.list_issues(&IssueFilter::default()).await?;
-        let by_key = index_by_key(&local, &conf.project);
+        // Without this every pull re-creates the whole backlog. The system half
+        // is answered by the database, so this lists Jira's beads rather than
+        // every bead in the workspace.
+        let local = store.list_issues(&owned()).await?;
+        let by_key = index_by_key(&local);
         let ids: Vec<String> = local.iter().map(|i| i.id.clone()).collect();
         let labels: HashMap<String, Vec<String>> = store.labels_of(&ids).await?.into_iter().collect();
 
@@ -300,6 +302,20 @@ impl Tracker for Jira {
                 ));
                 continue;
             }
+            // A ref with no system attached names something we cannot identify —
+            // `PROJ-12` is a Jira key, but `42` is a work item, an issue number,
+            // or nothing. Filing it would create a *second* remote issue for work
+            // that already has one somewhere, and overwriting the ref would
+            // destroy the only link back to it.
+            if issue.source_system.is_empty()
+                && let Some(r) = &issue.external_ref
+            {
+                report.skipped.push(format!(
+                    "{}: external_ref `{r}` has no source_system — not assumed to be jira",
+                    issue.id
+                ));
+                continue;
+            }
 
             let mut mine = issue.labels.clone();
             if mine.is_empty() {
@@ -317,7 +333,7 @@ impl Tracker for Jira {
                 ));
             }
 
-            match linked_key(issue, &conf.project) {
+            match linked_key(issue) {
                 Some(key) => {
                     let url = format!("{}/rest/api/3/issue/{key}", conf.base);
                     let body = json!({ "fields": push_fields(issue, &pushable, None) });
@@ -343,16 +359,16 @@ impl Tracker for Jira {
                         bail!("Jira accepted {} but returned no key: {}", issue.id, brief(&created));
                     };
 
-                    // Write the remote's id back, or the next pull sees a bead it
-                    // has never heard of and files a duplicate.
-                    //
-                    // NOTE: `IssuePatch` has no `source_system`, so the other half
-                    // of the join key cannot be written here. See `linked_key`.
+                    // Both halves of the join key, or the next pull sees a bead it
+                    // has never heard of and files a duplicate. The key alone is
+                    // not enough: identity is the pair, and `linked_key` will not
+                    // recognize a bead whose `source_system` is empty.
                     store
                         .update_issue(
                             &issue.id,
                             &IssuePatch {
                                 external_ref: Field::Set(key.to_string()),
+                                source_system: Field::Set("jira".to_string()),
                                 ..Default::default()
                             },
                         )
@@ -409,35 +425,34 @@ impl Jira {
 
 /// The Jira key this bead is already linked to, if any.
 ///
-/// The contract's join key is the pair (`source_system`, `external_ref`), and a
-/// bead we *pulled* carries both. A bead we *pushed* carries only
-/// `external_ref`: `IssuePatch` cannot set `source_system`, so after `push`
-/// creates a Jira issue there is no way to stamp the system half of the pair.
+/// The join key is the pair (`source_system`, `external_ref`), and every bead
+/// this tracker touches carries both — `pull` writes them on create, `push`
+/// writes them on the bead it just filed. So the pair is the whole test.
 ///
-/// So an unstamped bead counts as ours when its ref is shaped like a key in
-/// *our* project (`PROJ-123`) — narrow enough that another tracker's ref cannot
-/// collide with it, and the only alternative is a pull that duplicates every
-/// issue this workspace has ever pushed. The proper fix is a `source_system`
-/// field on `IssuePatch`; it is in the report.
-fn linked_key(issue: &Issue, project: &str) -> Option<String> {
-    let key = issue.external_ref.as_deref()?;
-    match issue.source_system.as_str() {
-        "jira" => Some(key.to_string()),
-        "" if is_key_of(key, project) => Some(key.to_string()),
-        _ => None,
+/// This used to have a second arm: a bead with an *empty* `source_system` was
+/// taken to be ours when its ref merely looked like a key in our project
+/// (`PROJ-123`), because `push` could not stamp `source_system` and the
+/// alternative was duplicating every issue this workspace had ever pushed. It
+/// was a guess, and a guess about identity is a way to adopt somebody else's
+/// bead. It is gone.
+fn linked_key(issue: &Issue) -> Option<String> {
+    (issue.source_system == "jira")
+        .then(|| issue.external_ref.clone())
+        .flatten()
+}
+
+/// The beads Jira owns — the same question, pushed into SQL.
+fn owned() -> IssueFilter {
+    IssueFilter {
+        source_system: Some("jira".to_string()),
+        ..Default::default()
     }
 }
 
-fn is_key_of(key: &str, project: &str) -> bool {
-    key.strip_prefix(project)
-        .and_then(|rest| rest.strip_prefix('-'))
-        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-}
-
-fn index_by_key(local: &[Issue], project: &str) -> HashMap<String, String> {
+fn index_by_key(local: &[Issue]) -> HashMap<String, String> {
     local
         .iter()
-        .filter_map(|i| linked_key(i, project).map(|k| (k, i.id.clone())))
+        .filter_map(|i| linked_key(i).map(|k| (k, i.id.clone())))
         .collect()
 }
 
@@ -743,33 +758,15 @@ fn push_fields(issue: &Issue, labels: &[String], project: Option<&str>) -> Value
 // base64
 // ---------------------------------------------------------------------------
 
-/// Standard base64, padded. Hand-rolled because adding a dependency to the
-/// workspace manifest is not this file's to make, and Basic auth is the one
-/// thing here that cannot be skipped.
+/// Standard base64, **padded**, standard alphabet.
+///
+/// A one-line adapter rather than a call site, so the engine choice is stated
+/// once and pinned by the RFC vectors below. `URL_SAFE` and the `NO_PAD` engines
+/// both encode `email:token` into something Jira answers with a 401 — and that
+/// 401 talks about authentication headers, not about the alphabet.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
-        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Enough of a record to identify it in an error, without pasting a page of JSON.
@@ -824,12 +821,35 @@ mod tests {
         assert_eq!(adf_to_text(&json!("plain v2 text")), "plain v2 text");
     }
 
+    /// Identity is the pair, and only the pair.
+    ///
+    /// A bead whose `external_ref` *looks* like one of our keys but carries no
+    /// `source_system` is not ours. That guess used to be how a pushed bead was
+    /// recognized, and it is unsafe in the general case — every tracker's refs
+    /// live in the same column, and `42` is a work item, an issue number, and a
+    /// page id at the same time.
     #[test]
-    fn a_key_belongs_to_its_project_only() {
-        assert!(is_key_of("PROJ-12", "PROJ"));
-        assert!(!is_key_of("PROJECT-12", "PROJ"));
-        assert!(!is_key_of("PROJ-", "PROJ"));
-        assert!(!is_key_of("OTHER-1", "PROJ"));
-        assert!(!is_key_of("12", "PROJ"));
+    fn a_bead_is_jiras_only_when_it_says_so() {
+        let mut pulled = Issue::new("bd-1", "t");
+        pulled.source_system = "jira".into();
+        pulled.external_ref = Some("PROJ-12".into());
+        assert_eq!(linked_key(&pulled).as_deref(), Some("PROJ-12"));
+
+        // Shaped exactly like one of ours, and not ours.
+        let mut unstamped = Issue::new("bd-2", "t");
+        unstamped.external_ref = Some("PROJ-12".into());
+        assert_eq!(linked_key(&unstamped), None);
+
+        let mut theirs = Issue::new("bd-3", "t");
+        theirs.source_system = "github".into();
+        theirs.external_ref = Some("42".into());
+        assert_eq!(linked_key(&theirs), None);
+
+        // Ours, but bound to nothing yet: a create, not an update.
+        let mut fresh = Issue::new("bd-4", "t");
+        fresh.source_system = "jira".into();
+        assert_eq!(linked_key(&fresh), None);
+
+        assert_eq!(owned().source_system.as_deref(), Some("jira"));
     }
 }

@@ -19,6 +19,7 @@ bd-query = { workspace = true }
 bd-sqlite = { workspace = true }
 bd-storage = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }

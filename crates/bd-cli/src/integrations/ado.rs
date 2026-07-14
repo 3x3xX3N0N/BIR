@@ -47,12 +47,6 @@ const API_VERSION: &str = "7.0";
 /// The hard cap on `?ids=` for the work item batch endpoint. Trap 3.
 const MAX_BATCH_IDS: usize = 200;
 
-/// Where push records the id it was given, in the bead's `metadata`.
-///
-/// This exists only because [`IssuePatch`] has no `source_system` field — see
-/// [`is_ours`]. It is a marker, not a mapping anyone should read.
-const MARKER: &str = "ado";
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -130,31 +124,15 @@ fn basic_auth(pat: &str) -> String {
     format!("Basic {}", b64(format!(":{pat}").as_bytes()))
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64, padded. Hand-rolled because adding a dependency would mean
-/// editing the workspace manifest, which this wave does not own — and it is
-/// twelve lines.
+/// Standard base64, **padded**, standard alphabet.
+///
+/// A one-line adapter rather than a call site, so the engine choice is stated
+/// once and pinned by the RFC vectors below: `URL_SAFE` (`-_` for `+/`) and any
+/// of the `NO_PAD` engines produce a credential Azure rejects with a 401 that
+/// blames the PAT.
 fn b64(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for c in input.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(c.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(c.get(2).copied().unwrap_or(0));
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            B64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            B64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(input)
 }
 
 fn get(cfg: &Cfg, url: String) -> HttpRequest {
@@ -317,47 +295,26 @@ fn work_item_type(t: &IssueType) -> &'static str {
 
 /// The work item id this bead is bound to, if it is bound to one of ours.
 ///
-/// The contract is `(source_system == "ado", external_ref)`. The second arm is
-/// **a workaround for a gap in the storage seam**: [`IssuePatch`] has no
-/// `source_system` field, so `push` — which updates an existing local bead — can
-/// stamp `external_ref` and nothing else. Without a way to recognize those
-/// beads, the very next pull would see an id it does not know and clone the
-/// backlog it had just pushed. So push also drops a marker in `metadata`, and
-/// this reads it.
+/// The key is the pair (`source_system == "ado"`, `external_ref`), and both
+/// halves are stamped by `pull` and by `push` alike — so the field is the whole
+/// answer.
 ///
-/// Matching on "external_ref set, source_system empty" *without* the marker
-/// would have been simpler and wrong: work item 42 and GitHub issue 42 are both
-/// bare numbers, and a pull would then walk into the other tracker's bead.
-///
-/// **Delete this arm** the day `IssuePatch` grows `source_system: Field<String>`
-/// — it is dead weight the moment push can stamp the field properly.
+/// It once had a second arm that accepted "external_ref set, source_system
+/// empty" as ours, backed by a marker in `metadata`, because `push` could not
+/// write `source_system`. Matching on the empty source_system *alone* would have
+/// been simpler and badly wrong: work item 42 and GitHub issue 42 are both the
+/// bare string "42", and a pull would have walked straight into the other
+/// tracker's bead.
 fn is_ours(i: &Issue) -> Option<String> {
-    if i.source_system == NAME {
-        return i.external_ref.clone();
-    }
-    if i.source_system.is_empty()
-        && let Some(m) = i.metadata.as_ref()
-        && let Some(id) = m.get(MARKER).and_then(|v| v.get("work_item_id"))
-    {
-        let id = id.as_str().map(str::to_string)?;
-        // The marker and the ref must agree; if a human has since edited one of
-        // them, trust neither.
-        return i.external_ref.clone().filter(|r| *r == id);
-    }
-    None
+    (i.source_system == NAME).then(|| i.external_ref.clone()).flatten()
 }
 
-/// `metadata` with the push marker merged in, preserving whatever else is there.
-fn with_marker(i: &Issue, work_item_id: i64) -> Value {
-    let mut m = match i.metadata.clone() {
-        Some(Value::Object(o)) => o,
-        _ => Map::new(),
-    };
-    m.insert(
-        MARKER.to_string(),
-        json!({ "work_item_id": work_item_id.to_string() }),
-    );
-    Value::Object(m)
+/// The beads ADO owns, as a question for the database rather than a scan.
+fn owned() -> IssueFilter {
+    IssueFilter {
+        source_system: Some(NAME.to_string()),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,10 +386,10 @@ impl Tracker for Ado {
         }
         let items = fetch_work_items(&cfg, http, &ids).await?;
 
-        // The join key, indexed once. `IssueFilter` cannot select on
-        // external_ref (see the report), so this is a full listing — the cost is
-        // one query, not one per work item.
-        let local = store.list_issues(&IssueFilter::default()).await?;
+        // The join key, indexed once. `IssueFilter` selects on `source_system`,
+        // so the listing is only the beads ADO owns — one query, not one per work
+        // item and not a scan of the workspace.
+        let local = store.list_issues(&owned()).await?;
         let index: HashMap<String, String> = local
             .iter()
             .filter_map(|i| is_ours(i).map(|r| (r, i.id.clone())))
@@ -630,11 +587,13 @@ impl Tracker for Ado {
                 .json()
                 .with_context(|| format!("ado: creating a work item for {}", i.id))?;
 
-            // Bind the bead to the work item *now*. A create that is not
-            // recorded locally is a create that happens again on the next push.
+            // Bind the bead to the work item *now*, both halves of the key. A
+            // create that is not recorded locally is a create that happens again
+            // on the next push; a create recorded without its `source_system` is
+            // a bead the next *pull* does not recognize and duplicates.
             let patch = IssuePatch {
                 external_ref: Field::Set(created.id.to_string()),
-                metadata: Field::Set(with_marker(&i, created.id)),
+                source_system: Field::Set(NAME.to_string()),
                 ..Default::default()
             };
             store.update_issue(&i.id, &patch).await?;

@@ -13,16 +13,13 @@
 //!   on every run;
 //! * a pull that ignores the cursor syncs page one and reports success.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
-use anyhow::Result;
-use async_trait::async_trait;
 use bd_cli::cli::Cli;
 use bd_cli::context::{Ctx, Need};
-use bd_cli::integrations::http::{FakeHttp, Http, HttpRequest, HttpResponse, Method};
+use bd_cli::integrations::http::{FakeHttp, Method};
 use bd_cli::integrations::notion::Notion;
 use bd_cli::integrations::Tracker;
 use bd_core::{IssueFilter, Issue, Priority, Status};
@@ -110,52 +107,6 @@ async fn issue(ctx: &Ctx, id: &str) -> Issue {
 fn only(issues: &[Issue]) -> &Issue {
     assert_eq!(issues.len(), 1, "expected exactly one issue, got {issues:?}");
     &issues[0]
-}
-
-/// Responses queued *per key*, popped in order.
-///
-/// `FakeHttp` keys one response per `"METHOD url"`, which cannot express Notion's
-/// pagination: the cursor travels in the POST **body**, so page one and page two
-/// are the same method and the same URL. Replaying the first response forever
-/// would either hang the tracker or hide the bug the test is hunting. So the
-/// pagination test uses this; everything else uses `FakeHttp`.
-#[derive(Default)]
-struct SeqHttp {
-    queued: Mutex<HashMap<String, VecDeque<HttpResponse>>>,
-    seen: Mutex<Vec<HttpRequest>>,
-}
-
-impl SeqHttp {
-    fn on(self, method: Method, url: &str, status: u16, body: &str) -> Self {
-        self.queued
-            .lock()
-            .unwrap()
-            .entry(format!("{} {url}", method.as_str()))
-            .or_default()
-            .push_back(HttpResponse {
-                status,
-                body: body.to_string(),
-            });
-        self
-    }
-
-    fn requests(&self) -> Vec<HttpRequest> {
-        self.seen.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl Http for SeqHttp {
-    async fn send(&self, req: HttpRequest) -> Result<HttpResponse> {
-        let key = format!("{} {}", req.method.as_str(), req.url);
-        self.seen.lock().unwrap().push(req);
-        self.queued
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .and_then(|q| q.pop_front())
-            .ok_or_else(|| anyhow::anyhow!("SeqHttp: no queued response left for `{key}`"))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +389,14 @@ async fn cursor_pagination_is_followed_to_the_last_page() {
       "next_cursor": null
     }"#;
 
-    let http = SeqHttp::default()
-        .on(Method::Post, QUERY_URL, 200, page1)
-        .on(Method::Post, QUERY_URL, 200, page2);
+    // The cursor travels in the POST *body*, so page one and page two are the
+    // same method and the same URL. `on()` keys one response per `"METHOD url"`
+    // and cannot express that at all; `on_seq` queues them.
+    let http = FakeHttp::new().on_seq(
+        Method::Post,
+        QUERY_URL,
+        vec![(200, page1.to_string()), (200, page2.to_string())],
+    );
 
     let report = Notion.pull(&ctx, &http).await.unwrap();
     assert_eq!((report.pulled, report.created), (2, 2));
@@ -536,6 +492,74 @@ async fn push_patches_the_linked_page_using_the_columns_the_database_actually_ha
     assert_eq!(props["Status"]["status"]["name"], "In progress");
     assert_eq!(props["Priority"]["select"]["name"], "P1");
     assert_eq!(props["Tags"]["multi_select"][0]["name"], "infra");
+}
+
+/// A locally-authored bead becomes a Notion page, and the page is *claimed* —
+/// both halves of the join key written back.
+///
+/// Push used to refuse this outright, and said so in `skipped`: it could stamp
+/// the page id on the bead but not `source_system`, so the next pull would not
+/// recognize the page it had just created and would file a second bead for it,
+/// and again on every sync after that. The refusal was the honest thing to do
+/// while the seam could not express ownership. It can now.
+#[tokio::test]
+async fn push_creates_a_page_for_a_local_bead_and_the_next_pull_does_not_duplicate_it() {
+    let (_d, ctx) = workspace("push-create").await;
+
+    let store = ctx.store().await.unwrap();
+    let id = store.next_id("nt", "Written locally", "").await.unwrap();
+    store
+        .create_issue(&Issue::new(id.as_str(), "Written locally"))
+        .await
+        .unwrap();
+
+    let schema = r#"{
+      "properties": {
+        "Name": { "type": "title", "title": {} },
+        "Status": { "type": "status", "status": { "options": [
+          { "name": "Not started" }, { "name": "Done" }
+        ] } }
+      }
+    }"#;
+
+    let http = FakeHttp::new()
+        .on(Method::Get, SCHEMA_URL, 200, schema)
+        .on(
+            Method::Post,
+            "https://api.notion.com/v1/pages",
+            200,
+            r#"{ "id": "page-new" }"#,
+        );
+
+    let report = Notion.push(&ctx, &http).await.unwrap();
+    assert_eq!(report.pushed, 1, "a local bead must reach notion: {report:?}");
+
+    let bead = issue(&ctx, &id).await;
+    assert_eq!(bead.external_ref.as_deref(), Some("page-new"));
+    assert_eq!(
+        bead.source_system, "notion",
+        "the page is unclaimed, so the next pull will file a second bead for it"
+    );
+
+    // The proof: pull the page back and it lands on the bead we already have.
+    let back = r#"{
+      "results": [
+        { "id": "page-new", "properties": {
+            "Name": { "type": "title", "title": [{ "plain_text": "Written locally" }] } } }
+      ],
+      "has_more": false,
+      "next_cursor": null
+    }"#;
+    let report = Notion
+        .pull(&ctx, &FakeHttp::new().on(Method::Post, QUERY_URL, 200, back))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.created, report.updated),
+        (0, 1),
+        "the page push just created came back as a second bead"
+    );
+    assert_eq!(all_issues(&ctx).await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ bd-storage = { path = "crates/bd-storage" }
 bd-sqlite = { path = "crates/bd-sqlite" }
 
 anyhow = "1"
+base64 = "0.22"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

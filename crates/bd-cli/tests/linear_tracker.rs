@@ -5,15 +5,13 @@
 //! *asked for* as much as what it stored — a tracker that pages correctly and one
 //! that silently syncs page one look identical from the outside.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
-use async_trait::async_trait;
 use bd_cli::cli::Cli;
 use bd_cli::context::{Ctx, Need};
-use bd_cli::integrations::http::{FakeHttp, Http, HttpRequest, HttpResponse, Method};
+use bd_cli::integrations::http::{FakeHttp, Method};
 use bd_cli::integrations::{Tracker, linear::Linear};
 use bd_core::{IssueFilter, Issue, Priority, Status};
 use bd_storage::Identity;
@@ -108,49 +106,21 @@ async fn by_ref(ctx: &Ctx, external_ref: &str) -> Issue {
 
 /// Responses in order, one per request.
 ///
-/// [`FakeHttp`] keys its canned responses on `"METHOD url"`, and *every* Linear
-/// request is a POST to the same endpoint — so it cannot express a fixture whose
-/// second response differs from its first, which is exactly what paging and
-/// mutation sequences are. This is that fixture. It also records the bodies, so a
-/// test can assert the cursor was actually sent rather than merely parsed.
-struct SeqHttp {
-    queue: Mutex<VecDeque<(u16, String)>>,
-    seen: Mutex<Vec<HttpRequest>>,
-}
-
-impl SeqHttp {
-    fn new(bodies: &[&str]) -> Self {
-        SeqHttp {
-            queue: Mutex::new(bodies.iter().map(|b| (200u16, b.to_string())).collect()),
-            seen: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn requests(&self) -> Vec<HttpRequest> {
-        self.seen.lock().unwrap().clone()
-    }
-
-    fn bodies(&self) -> Vec<String> {
-        self.requests()
-            .into_iter()
-            .map(|r| r.body.unwrap_or_default())
-            .collect()
-    }
-}
-
-#[async_trait]
-impl Http for SeqHttp {
-    async fn send(&self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
-        assert_eq!(req.url, ENDPOINT, "Linear speaks GraphQL at one URL only");
-        assert_eq!(req.method, Method::Post, "GraphQL is always a POST");
-        self.seen.lock().unwrap().push(req);
-        match self.queue.lock().unwrap().pop_front() {
-            Some((status, body)) => Ok(HttpResponse { status, body }),
-            // Loud, not empty: a tracker that made one request too many must not
-            // be handed a blank 200 and pass.
-            None => anyhow::bail!("SeqHttp: the tracker made more requests than the fixture has"),
-        }
-    }
+/// Every Linear request is a POST to the same endpoint, so `FakeHttp::on()` —
+/// one canned response per `"METHOD url"` — cannot express a fixture whose second
+/// response differs from its first, which is exactly what paging and mutation
+/// sequences are. `on_seq` queues them against that one key.
+///
+/// A request to any *other* URL finds no stub and fails loudly, which is the
+/// assertion that Linear speaks GraphQL at one URL only. Running the queue dry
+/// fails just as loudly: a tracker that made one request too many must never be
+/// handed a blank 200 and pass.
+fn seq(bodies: &[&str]) -> FakeHttp {
+    FakeHttp::new().on_seq(
+        Method::Post,
+        ENDPOINT,
+        bodies.iter().map(|b| (200u16, b.to_string())).collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +340,7 @@ async fn cursor_pagination_is_followed() {
        "state":{"name":"Todo","type":"unstarted"},"assignee":null,"labels":{"nodes":[]}}
     ],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}"#;
 
-    let http = SeqHttp::new(&[page1, page2]);
+    let http = seq(&[page1, page2]);
     let report = Linear.pull(&ctx, &http).await.expect("pull");
 
     assert_eq!(report.pulled, 2, "both pages must be synced");
@@ -469,7 +439,7 @@ async fn push_creates_an_unlinked_bead_and_records_the_link() {
     let created = r#"{"data":{"issueCreate":{"success":true,
       "issue":{"id":"new-remote-uuid","identifier":"ENG-99",
                "url":"https://linear.app/acme/issue/ENG-99"}}}}"#;
-    let http = SeqHttp::new(&[team_fixture(), created]);
+    let http = seq(&[team_fixture(), created]);
 
     let report = Linear.push(&ctx, &http).await.expect("push");
     assert_eq!(report.pushed, 1);
@@ -514,7 +484,7 @@ async fn push_updates_a_linked_bead_in_place() {
     let updated = r#"{"data":{"issueUpdate":{"success":true,
       "issue":{"id":"11111111-1111-1111-1111-111111111111","identifier":"ENG-1","url":null}}}}"#;
     // Four beads pulled, so four mutations follow the team lookup.
-    let http = SeqHttp::new(&[team_fixture(), updated, updated, updated, updated]);
+    let http = seq(&[team_fixture(), updated, updated, updated, updated]);
 
     let report = Linear.push(&ctx, &http).await.expect("push");
     assert_eq!(report.pushed, 4);
@@ -565,7 +535,7 @@ async fn push_declines_beads_owned_by_another_tracker() {
 
     // Only the team lookup is stubbed: a mutation would run the fixture dry and
     // fail the test loudly, which is the assertion.
-    let http = SeqHttp::new(&[team_fixture()]);
+    let http = seq(&[team_fixture()]);
     let report = Linear.push(&ctx, &http).await.expect("push");
 
     assert_eq!(report.pushed, 0);

@@ -12,17 +12,17 @@
 //!    is not rare. A tracker that reads only the first page looks *exactly* like
 //!    one that worked. So we walk pages until one comes back short.
 //!
-//!    GitHub's own answer is the `Link` header's `rel="next"` — but
-//!    [`HttpResponse`](super::HttpResponse) carries only a status and a body, so
-//!    no header is reachable from behind the seam. Page-walking is the honest
-//!    fallback: same result, one extra request when the issue count happens to be
-//!    an exact multiple of the page size. Give the seam
-//!    `headers: Vec<(String, String)>` and this becomes a `Link` walk.
+//!    GitHub's own answer is the `Link` header's `rel="next"`, which the seam now
+//!    carries. The short-page walk is kept because it is the more robust of the
+//!    two — it needs nothing from the server but the data it asked for — and it
+//!    costs one extra request only when the issue count is an exact multiple of
+//!    the page size.
 //!
-//! 3. **Identity.** Every pulled bead carries `external_ref = "<number>"` and
-//!    `source_system = "github"`. That pair is the join key, and the next pull
-//!    finds an existing bead by it and *updates* rather than inserting a second
-//!    copy. Get this wrong and every sync duplicates the backlog.
+//! 3. **Identity.** Every bead this tracker owns carries `external_ref =
+//!    "<number>"` and `source_system = "github"` — pulled *and* pushed, since
+//!    [`IssuePatch`] can now stamp both. That pair is the join key, and the next
+//!    pull finds an existing bead by it and *updates* rather than inserting a
+//!    second copy. Get this wrong and every sync duplicates the backlog.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,17 +45,6 @@ pub const NAME: &str = "github";
 
 /// The workspace config key holding `owner/name`. Set with `bd config set`.
 pub const REPO_KEY: &str = "github.repo";
-
-/// A local bead carrying this label is destined for GitHub even though it did
-/// not come from there.
-///
-/// It exists because there is no other way to say it: `IssuePatch` has no
-/// `source_system` field, so nothing on the CLI side can stamp a locally-created
-/// bead as GitHub's. A label is the only durable, user-settable marker
-/// available. `push` strips it from what it sends (it is beads' bookkeeping, not
-/// the repo's), and `pull` preserves it when reconciling labels — otherwise the
-/// first pull after a push would strip the bead's only mark of ownership.
-pub const MARKER_LABEL: &str = "github";
 
 const API: &str = "https://api.github.com";
 const ACCEPT: &str = "application/vnd.github+json";
@@ -287,24 +276,21 @@ impl Tracker for GitHub {
 
         let remote = fetch_all(&repo, http, &mut report).await?;
 
-        // One scan, one label query — not one lookup per remote issue. A repo
-        // with 500 issues would otherwise be 500 round trips into SQLite.
-        let locals = store.list_issues(&IssueFilter::default()).await?;
+        // THE JOIN KEY: (source_system, external_ref). Anything that misses here
+        // gets inserted a second time, and the duplicate is permanent.
+        //
+        // Half of it is pushed into SQL, so this reads only the beads GitHub owns
+        // rather than the whole workspace. One query, one label query — not one
+        // lookup per remote issue.
+        let locals = store.list_issues(&ours()).await?;
         let ids: Vec<String> = locals.iter().map(|i| i.id.clone()).collect();
         let mut labels: HashMap<String, Vec<String>> =
             store.labels_of(&ids).await?.into_iter().collect();
 
-        // THE JOIN KEY: (source_system, external_ref). Anything that misses here
-        // gets inserted a second time, and the duplicate is permanent.
-        let mut by_ref: HashMap<&str, &Issue> = HashMap::new();
-        for i in &locals {
-            let Some(ext) = i.external_ref.as_deref() else {
-                continue;
-            };
-            if owns(i, labels.get(&i.id).map(Vec::as_slice).unwrap_or(&[])) {
-                by_ref.insert(ext, i);
-            }
-        }
+        let by_ref: HashMap<&str, &Issue> = locals
+            .iter()
+            .filter_map(|i| i.external_ref.as_deref().map(|ext| (ext, i)))
+            .collect();
 
         let prefix = ctx.prefix().await;
         for gh in &remote {
@@ -376,30 +362,41 @@ impl Tracker for GitHub {
         let labels: HashMap<String, Vec<String>> =
             store.labels_of(&ids).await?.into_iter().collect();
 
+        let mut infra = 0u64;
         for local in &locals {
-            let mine = labels.get(&local.id).map(Vec::as_slice).unwrap_or(&[]);
-            // A bead that came from Jira but happens to carry a `github` label is
-            // not ours to push — doing so would fork it across two trackers.
-            if !local.source_system.is_empty() && local.source_system != NAME {
-                if mine.iter().any(|l| l == MARKER_LABEL) {
-                    report.skipped.push(format!(
-                        "{}: labelled `{MARKER_LABEL}` but owned by `{}`",
-                        local.id, local.source_system
-                    ));
-                }
+            // Templates, molecules, gates and audit events are beads' own
+            // plumbing. Counted rather than listed: one line each would bury the
+            // skips that mean something.
+            if local.is_template || local.issue_type.excluded_from_ready() {
+                infra += 1;
                 continue;
             }
-            if !owns(local, mine) {
+            // Someone else's issue. Pushing it would fork the same work across
+            // two trackers, and neither copy would win.
+            if !local.source_system.is_empty() && local.source_system != NAME {
+                report.skipped.push(format!(
+                    "{}: belongs to {}, not github",
+                    local.id, local.source_system
+                ));
+                continue;
+            }
+            // An external_ref with no system attached: somebody set it by hand,
+            // and it names something we cannot identify. GitHub issue 42 and ADO
+            // work item 42 are both the bare string "42", so assuming it is ours
+            // would PATCH a stranger's issue. Overwriting it would destroy the
+            // only link back to whatever it points at.
+            if local.source_system.is_empty()
+                && let Some(r) = &local.external_ref
+            {
+                report.skipped.push(format!(
+                    "{}: external_ref `{r}` has no source_system — not assumed to be github",
+                    local.id
+                ));
                 continue;
             }
 
-            // The marker is beads' own bookkeeping. Creating a `github` label in
-            // someone's repo because of it would be rude and confusing.
-            let out: Vec<&str> = mine
-                .iter()
-                .map(String::as_str)
-                .filter(|l| *l != MARKER_LABEL)
-                .collect();
+            let mine = labels.get(&local.id).map(Vec::as_slice).unwrap_or(&[]);
+            let out: Vec<&str> = mine.iter().map(String::as_str).collect();
             let state = if local.status.is_closed() {
                 "closed"
             } else {
@@ -444,15 +441,14 @@ impl Tracker for GitHub {
                         .json()
                         .with_context(|| format!("github: creating an issue for {}", local.id))?;
 
-                    // Record the remote id immediately. If this write is lost the
-                    // next push creates the issue *again* — the local bead has no
-                    // memory of the one we just made.
-                    //
-                    // Note what we cannot do: stamp `source_system = "github"`.
-                    // `IssuePatch` has no such field. That is why the marker label
-                    // exists and why `owns` accepts it as a second key.
+                    // Both halves of the join key, immediately. If this write is
+                    // lost the next push creates the issue *again* — the local
+                    // bead has no memory of the one we just made — and if only
+                    // `external_ref` landed, the next *pull* would not recognize
+                    // the bead as GitHub's and would file a duplicate for it.
                     let patch = IssuePatch {
                         external_ref: Field::Set(created.number.to_string()),
+                        source_system: Field::Set(NAME.to_string()),
                         ..Default::default()
                     };
                     store.update_issue(&local.id, &patch).await?;
@@ -461,6 +457,11 @@ impl Tracker for GitHub {
             report.pushed += 1;
         }
 
+        if infra > 0 {
+            report.skipped.push(format!(
+                "{infra} template/infrastructure bead(s) are local-only and were not pushed"
+            ));
+        }
         Ok(report)
     }
 }
@@ -477,16 +478,12 @@ async fn repo(ctx: &Ctx) -> Result<Repo> {
     Repo::parse(&raw).ok_or_else(|| anyhow::anyhow!("{REPO_KEY} must be `owner/name` (got `{raw}`)"))
 }
 
-/// Whether this bead is GitHub's.
-///
-/// Two keys, not one, and the second is not redundant: a bead this tracker
-/// *created* on GitHub cannot be stamped with `source_system` (see
-/// [`MARKER_LABEL`]), so it is recognized by its marker instead. Without that,
-/// the first pull after a push would not find the bead it had just created and
-/// would duplicate it.
-fn owns(i: &Issue, labels: &[String]) -> bool {
-    i.source_system == NAME
-        || (i.source_system.is_empty() && labels.iter().any(|l| l == MARKER_LABEL))
+/// The beads GitHub owns — half the join key, answered by the database.
+fn ours() -> IssueFilter {
+    IssueFilter {
+        source_system: Some(NAME.to_string()),
+        ..Default::default()
+    }
 }
 
 fn authed(req: HttpRequest, token: Option<&str>) -> HttpRequest {
@@ -506,9 +503,11 @@ fn authed(req: HttpRequest, token: Option<&str>) -> HttpRequest {
 /// Every issue in the repo, following pagination.
 ///
 /// The stop condition is a *short page*: fewer than `per_page` records means
-/// there is no next page. It costs one extra request when the count is an exact
-/// multiple of 100, and it needs no response headers — which is the point, since
-/// the `Link` header is not visible through the [`Http`] seam.
+/// there is no next page. `Link: rel="next"` is now reachable through the seam
+/// (see [`HttpResponse::header`](super::HttpResponse::header)) and would work
+/// equally well; the short-page walk is kept because it depends on nothing but
+/// the data the server already sent, and costs one extra request only when the
+/// issue count is an exact multiple of 100.
 async fn fetch_all(repo: &Repo, http: &dyn Http, report: &mut SyncReport) -> Result<Vec<GhIssue>> {
     let tok = token();
     let mut all: Vec<GhIssue> = Vec::new();
@@ -579,19 +578,9 @@ async fn reconcile(
     }
 
     // Labels are a set, so they are reconciled rather than patched: GitHub's set
-    // wins, except that the marker survives (it is ours, not theirs, and pull
-    // must not strip the mark that push relies on).
-    let want: HashSet<&str> = gh
-        .labels
-        .iter()
-        .map(GhLabel::name)
-        .chain(
-            current_labels
-                .iter()
-                .map(String::as_str)
-                .filter(|l| *l == MARKER_LABEL),
-        )
-        .collect();
+    // wins outright. Ownership lives in `source_system`, not in a label, so there
+    // is nothing here that pull has to be careful to preserve.
+    let want: HashSet<&str> = gh.labels.iter().map(GhLabel::name).collect();
     let have: HashSet<&str> = current_labels.iter().map(String::as_str).collect();
 
     for add in want.difference(&have) {

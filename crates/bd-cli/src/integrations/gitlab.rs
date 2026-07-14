@@ -31,14 +31,10 @@
 //! - `issue_type` (issue/incident/test_case/task) is a different taxonomy from
 //!   ours; it is left alone rather than guessed at.
 //!
-//! # The seam gap this file works around
-//!
-//! [`IssuePatch`] can set `external_ref` but has **no `source_system` field**, so
-//! after `push` creates an issue on GitLab there is no way to stamp the local
-//! bead as ours. The next `pull` would then not recognize it and would duplicate
-//! it. Until the patch grows `source_system: Field<String>`, `push` writes a
-//! `metadata.gitlab` marker instead and [`is_ours`] reads it. That is the only
-//! reason this file looks in metadata at all; delete it the day the field lands.
+//! `metadata.gitlab` carries the global `id` and the `web_url` — information a
+//! bead would otherwise lose. Nothing joins on it. It once doubled as an
+//! ownership marker because [`IssuePatch`] could not set `source_system`; it can
+//! now, so [`is_ours`] reads the field and only the field.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -135,19 +131,17 @@ impl Tracker for GitLab {
     /// on, on every pull, and report success while doing it.
     async fn pull(&self, ctx: &Ctx, http: &dyn Http) -> Result<SyncReport> {
         let cfg = self.resolve(ctx).await?;
-        // The dispatcher exempts `pull` from this check; it still writes the
-        // local database, so it is a write and --readonly must refuse it.
-        ctx.ensure_writable("pull gitlab issues into the workspace")?;
 
         let remote = fetch_issues(http, &cfg).await?;
         let store = ctx.store().await?;
         let prefix = ctx.prefix().await;
 
         // The join: every bead we already own, keyed by the iid it came from.
-        let locals = store.list_issues(&IssueFilter::default()).await?;
+        // `source_system` is pushed into SQL, so this reads our beads rather than
+        // the workspace.
+        let locals = store.list_issues(&owned()).await?;
         let mine: HashMap<String, Issue> = locals
             .into_iter()
-            .filter(is_ours)
             .filter_map(|i| i.external_ref.clone().map(|r| (r, i)))
             .collect();
         // `list_issues` does not hydrate relations, so labels come separately —
@@ -243,7 +237,6 @@ impl Tracker for GitLab {
     /// are `POST`ed and then stamped with the iid GitLab minted for them.
     async fn push(&self, ctx: &Ctx, http: &dyn Http) -> Result<SyncReport> {
         let cfg = self.resolve(ctx).await?;
-        ctx.ensure_writable("push issues to gitlab")?;
 
         let store = ctx.store().await?;
         let locals = store.list_issues(&IssueFilter::default()).await?;
@@ -309,10 +302,10 @@ impl Tracker for GitLab {
                     let resp = cfg.send(http, req).await?;
                     let created: GlIssue = resp.json()?;
 
-                    // Stamp the bead with the iid GitLab just minted, or the next
-                    // pull creates a second copy of the issue we just created.
-                    // `source_system` cannot be patched (see the module docs), so
-                    // the marker goes in metadata, which can.
+                    // Both halves of the join key, or the next pull creates a
+                    // second copy of the issue we just created. The metadata is
+                    // not part of that key — it carries the global id and web_url,
+                    // which nothing joins on but which are lost if not kept.
                     let mut meta = issue
                         .metadata
                         .clone()
@@ -321,6 +314,7 @@ impl Tracker for GitLab {
                     meta[SOURCE] = created.marker()[SOURCE].clone();
                     let patch = IssuePatch {
                         external_ref: Field::Set(created.iid.to_string()),
+                        source_system: Field::Set(SOURCE.to_string()),
                         metadata: Field::Set(meta),
                         ..Default::default()
                     };
@@ -450,18 +444,19 @@ fn encode_path(id: &str) -> String {
         .collect()
 }
 
-/// Whether a local bead is one this tracker owns.
-///
-/// `source_system == "gitlab"` is the real test. The metadata fallback covers
-/// beads that `push` created on GitLab: [`IssuePatch`] has no `source_system`
-/// field, so push can stamp the iid but not the origin, and without the marker
-/// the next pull would treat every one of them as new.
+/// Whether a local bead is one this tracker owns. One test, one field — `push`
+/// stamps `source_system` on everything it creates, so there is nothing else to
+/// look at.
 fn is_ours(i: &Issue) -> bool {
     i.source_system == SOURCE
-        || (i.source_system.is_empty()
-            && i.metadata
-                .as_ref()
-                .is_some_and(|m| m.get(SOURCE).is_some_and(|g| !g.is_null())))
+}
+
+/// The same question, asked of the database.
+fn owned() -> IssueFilter {
+    IssueFilter {
+        source_system: Some(SOURCE.to_string()),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -548,15 +543,20 @@ mod tests {
     }
 
     #[test]
-    fn ownership_survives_a_push_that_could_not_set_source_system() {
+    fn ownership_is_the_source_system_and_nothing_else() {
         let mut pulled = Issue::new("bd-1", "t");
         pulled.source_system = SOURCE.to_string();
         assert!(is_ours(&pulled));
+        assert_eq!(owned().source_system.as_deref(), Some(SOURCE));
 
-        // What `push` leaves behind: no source_system (unpatchable), but a marker.
-        let mut pushed = Issue::new("bd-2", "t");
-        pushed.metadata = Some(json!({ "gitlab": { "id": 9, "iid": 2 } }));
-        assert!(is_ours(&pushed));
+        // A metadata blob is *not* a claim of ownership. `push` used to leave one
+        // because it could not stamp `source_system`; it can now, and a bead
+        // carrying the blob but not the field is a bead some import or hand edit
+        // left behind. Treating it as ours would let a stray `metadata.gitlab`
+        // key hand a stranger's issue to this tracker.
+        let mut marked = Issue::new("bd-2", "t");
+        marked.metadata = Some(json!({ "gitlab": { "id": 9, "iid": 2 } }));
+        assert!(!is_ours(&marked));
 
         // Another tracker's bead, and a plain local one, are not ours.
         let mut theirs = Issue::new("bd-3", "t");

@@ -376,6 +376,47 @@ fn mail_delegates_and_carries_the_providers_exit_code_out() {
     cleanup(&[tmp]);
 }
 
+/// `pull` is read-only against the *remote* and writes its entire result to the
+/// local database. It is a write, and `--readonly` has to refuse it.
+///
+/// This was exempted from the writability check on the reasoning that "pull is
+/// read-only", and `bd jira pull --readonly` cheerfully rewrote the workspace —
+/// creating issues, updating issues, and recomputing the blocked cache. Every
+/// tracker gets the same dispatcher, so every tracker gets the same guard, and
+/// the check lives in exactly one place.
+#[test]
+fn readonly_refuses_every_tracker_verb_that_writes() {
+    let tmp = tempdir("sync-readonly");
+    assert_eq!(run_as(&tmp, "alice", &["init"]).1, 0);
+
+    for tracker in ["jira", "linear", "github", "gitlab", "notion", "ado"] {
+        for verb in ["pull", "push", "sync"] {
+            let out = bd()
+                .args(["-C", tmp.to_str().unwrap(), "--readonly", tracker, verb])
+                .output()
+                .expect("run bd");
+            assert_ne!(
+                out.status.code(),
+                Some(0),
+                "`bd {tracker} {verb} --readonly` succeeded"
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("--readonly"),
+                "`bd {tracker} {verb}` under --readonly must be refused *as a write*, not \
+                 turned away for some other reason: {err}"
+            );
+        }
+
+        // `status` is the exception, and must stay one: it writes nothing, and it
+        // is the verb you run precisely when nothing else works.
+        let (_, code) = run_as(&tmp, "alice", &["--readonly", tracker, "status"]);
+        assert_eq!(code, 0, "`bd {tracker} status --readonly` must still answer");
+    }
+
+    cleanup(&[tmp]);
+}
+
 fn tempdir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "bd-cli-{tag}-{}-{:?}",

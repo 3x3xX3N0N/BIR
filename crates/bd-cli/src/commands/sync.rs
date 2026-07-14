@@ -211,7 +211,13 @@ fn patch_from(i: &Issue) -> IssuePatch {
         close_reason: Field::Set(i.close_reason.clone()),
         metadata: Field::authoritative(i.metadata.clone()),
         spec_id: Field::Set(i.spec_id.clone()),
+        // Both halves of the tracker join key, and both authoritative. An import
+        // that restored `external_ref` but dropped `source_system` would leave a
+        // bead no tracker recognizes — and the next sync would file a duplicate
+        // of it upstream. An empty `source_system` in the record is a real value
+        // ("no tracker owns this"), so it is written, not skipped.
         external_ref: Field::authoritative(i.external_ref.clone()),
+        source_system: Field::Set(i.source_system.clone()),
         pinned: Some(i.pinned),
         // A record that no longer says `ephemeral` is a record of a bead that was
         // promoted upstream. Keeping the old flag would leave a bead the peer
@@ -403,6 +409,15 @@ pub async fn tracker(ctx: &Ctx, name: &str, cmd: TrackerCmd) -> Result<()> {
         return Ok(());
     }
 
+    // Every remaining verb writes the **local database**, and that includes
+    // `pull`. Pull is read-only against the *remote*; the entire result of it is
+    // written here. `bd jira pull --readonly` used to be exempt on the reasoning
+    // that "pull is read-only", and it happily rewrote the workspace.
+    //
+    // Checked here and nowhere else. The guard belongs in front of the dispatch,
+    // not inside six trackers that each have to remember it.
+    ctx.ensure_writable(&format!("{name} {verb}"))?;
+
     // A tracker that is not yet built says so with exit 64, exactly like any
     // other unported command. It must not look like a configuration problem.
     let st = t.status(ctx).await?;
@@ -416,10 +431,6 @@ pub async fn tracker(ctx: &Ctx, name: &str, cmd: TrackerCmd) -> Result<()> {
             st.missing.join(", "),
             t.secret_env()
         );
-    }
-
-    if !matches!(cmd, TrackerCmd::Pull) {
-        ctx.ensure_writable(&format!("{name} {verb}"))?;
     }
 
     let http = integrations::http::RealHttp::new()?;

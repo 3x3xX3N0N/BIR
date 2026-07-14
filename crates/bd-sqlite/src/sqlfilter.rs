@@ -108,6 +108,15 @@ pub fn push_filter(qb: &mut QueryBuilder<'_, Sqlite>, f: &IssueFilter) {
     if let Some(spec) = &f.spec_id {
         qb.push(" AND spec_id = ").push_bind(spec.clone());
     }
+    // The tracker join key. `external_ref` is nullable, and `col = ?` is never
+    // true of NULL — so an issue bound to no remote is correctly excluded rather
+    // than matching every ref.
+    if let Some(sys) = &f.source_system {
+        qb.push(" AND source_system = ").push_bind(sys.clone());
+    }
+    if let Some(r) = &f.external_ref {
+        qb.push(" AND external_ref = ").push_bind(r.clone());
+    }
     if let Some(key) = &f.has_metadata_key {
         qb.push(
             " AND (CASE WHEN json_valid(metadata) \

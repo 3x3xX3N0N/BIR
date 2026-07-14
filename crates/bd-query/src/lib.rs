@@ -181,6 +181,20 @@ mod tests {
         if f.spec_id.as_ref().is_some_and(|s| i.spec_id != *s) {
             return false;
         }
+        // The tracker join key. `external_ref = ?` is an equality in SQL, so an
+        // issue whose ref is NULL matches nothing — not even an empty string.
+        if f.source_system
+            .as_ref()
+            .is_some_and(|s| i.source_system != *s)
+        {
+            return false;
+        }
+        if f.external_ref
+            .as_ref()
+            .is_some_and(|r| i.external_ref.as_deref() != Some(r.as_str()))
+        {
+            return false;
+        }
         if f.has_metadata_key.as_ref().is_some_and(|k| {
             !i.metadata
                 .as_ref()

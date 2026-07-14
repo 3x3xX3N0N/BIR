@@ -218,7 +218,20 @@ pub struct IssuePatch {
     pub defer_until: Field<DateTime<Utc>>,
     pub metadata: Field<serde_json::Value>,
     pub spec_id: Field<String>,
+    /// The remote's id for this issue (`"PROJ-123"`, `"42"`).
     pub external_ref: Field<String>,
+    /// Which remote that id belongs to (`"jira"`, `"github"`).
+    ///
+    /// Identity across a tracker boundary is the **pair** (`source_system`,
+    /// `external_ref`), and both halves have to be writable on an *existing*
+    /// issue — that is precisely what `push` does when it creates a remote issue
+    /// for a locally-authored bead. With only `external_ref` here, a pushed bead
+    /// could record which id it was given but not which system gave it, so the
+    /// next `pull` did not recognize the issue it had just created and filed a
+    /// duplicate. Every tracker independently invented a marker (a label, a
+    /// metadata blob, a guess at the shape of the ref) to work around its
+    /// absence; all of them are gone.
+    pub source_system: Field<String>,
     /// The TTL class of an ephemeral bead. Clearable, because a promoted wisp
     /// has no TTL — leaving one behind would let `bd gc` reap the real bead it
     /// just became.

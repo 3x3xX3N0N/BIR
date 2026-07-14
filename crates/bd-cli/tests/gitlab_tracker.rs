@@ -414,11 +414,14 @@ async fn push_creates_then_links_and_updates_what_it_owns() {
     let report = GitLab.push(&ctx, &http).await.expect("push");
     assert_eq!(report.pushed, 2);
 
-    // The local bead now carries the iid it was given, and the marker that says
-    // whose iid it is — `IssuePatch` cannot set `source_system`, so without the
-    // marker the next pull would not recognize it.
+    // The local bead now carries both halves of the join key: the iid it was
+    // given, and the system that gave it. Without the second, the next pull does
+    // not recognize the issue push just created and files a duplicate.
     let pushed = store.get_issue(&id).await.unwrap().unwrap();
     assert_eq!(pushed.external_ref.as_deref(), Some("42"));
+    assert_eq!(pushed.source_system, "gitlab");
+    // The metadata is not the key — it carries the *global* id and the web_url,
+    // which nothing joins on and which would otherwise be lost.
     assert_eq!(pushed.metadata.as_ref().unwrap()["gitlab"]["iid"], json!(42));
 
     // And that is enough to make the round trip idempotent: pulling the issue we

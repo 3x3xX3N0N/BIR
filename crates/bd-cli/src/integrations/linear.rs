@@ -110,10 +110,8 @@ impl Tracker for Linear {
         let store = ctx.store().await?;
         let prefix = ctx.prefix().await;
 
-        // The join key. `IssueFilter` cannot express "where external_ref = ?", so
-        // the index is built once in memory rather than issuing one query per
-        // remote issue. See the note on `linked_index` for why an empty
-        // source_system is also accepted.
+        // The join key, indexed once — one query for the beads Linear owns, not
+        // one per remote issue.
         let mut index = linked_index(store).await?;
         let mut labels = labels_index(store, &index).await?;
 
@@ -266,20 +264,17 @@ impl Tracker for Linear {
             if linked.is_none()
                 && let Some(remote) = payload.issue
             {
-                // Record the link, or the next pull sees a brand-new remote issue
-                // and creates a *second* local bead for the one we just pushed.
-                //
-                // Only half of the join key can be written here: `IssuePatch` has
-                // an `external_ref` field and no `source_system` field, so a bead
-                // created by push keeps an empty source_system forever. `pull`
-                // compensates by treating an empty source_system as a match — see
-                // `linked_index`. The real fix is a `source_system: Field<String>`
-                // on `IssuePatch`, which lives in a frozen file.
+                // Record the link — *both halves of it*, or the next pull sees a
+                // brand-new remote issue and creates a second local bead for the
+                // one we just pushed. `external_ref` alone is not the key:
+                // `linked_index` joins on the pair, and a bead with no
+                // `source_system` is a bead Linear does not recognize as its own.
                 store
                     .update_issue(
                         &local.id,
                         &IssuePatch {
                             external_ref: Field::Set(remote.id.clone()),
+                            source_system: Field::Set("linear".to_string()),
                             metadata: Field::Set(remote.metadata()),
                             ..Default::default()
                         },
@@ -788,27 +783,31 @@ fn patch_from(node: &LinearIssue) -> IssuePatch {
 
 /// Is this bead ours to update?
 ///
-/// `source_system == "linear"` is the real answer. The empty case is the
-/// concession described in `push`: a bead that *we* created in Linear carries the
-/// external_ref we wrote but an empty source_system, because `IssuePatch` has no
-/// field for it. Excluding it here would make every push-created bead come back
-/// as a duplicate on the next pull — the exact failure the join key exists to
-/// prevent. A bead belonging to another tracker (`jira`, `github`) has a
-/// non-empty source_system and is never touched.
+/// `source_system == "linear"`, and nothing else. `push` stamps the field on
+/// every bead it creates upstream, so there is no such thing as a Linear bead
+/// that does not say so.
+///
+/// This used to accept an *empty* source_system too, because a bead push had
+/// created carried the ref we wrote and nothing else — `IssuePatch` had no field
+/// for the system half of the key. It was a concession, and an unsafe one: an
+/// empty source_system with a ref set is just as likely to be a hand edit, an
+/// import, or another tracker's bead mid-repair, and adopting it would fork that
+/// bead's identity across two systems.
 fn ours(issue: &Issue) -> bool {
-    issue.source_system == "linear" || issue.source_system.is_empty()
+    issue.source_system == "linear"
 }
 
-/// Every local bead that carries a Linear reference, keyed by that reference.
+/// The beads Linear owns, keyed by the Linear id they came from.
 ///
-/// One full listing rather than a query per remote issue: `IssueFilter` has no
-/// `external_ref` or `source_system` field, so there is nothing to push down.
+/// One listing of *our* beads rather than a scan of the workspace: the
+/// `source_system` half of the join key is a filter the database can answer.
 async fn linked_index(store: &dyn Storage) -> Result<HashMap<String, Issue>> {
+    let filter = IssueFilter {
+        source_system: Some("linear".to_string()),
+        ..Default::default()
+    };
     let mut index = HashMap::new();
-    for issue in store.list_issues(&IssueFilter::default()).await? {
-        if !ours(&issue) {
-            continue;
-        }
+    for issue in store.list_issues(&filter).await? {
         if let Some(r) = issue.external_ref.clone().filter(|r| !r.is_empty()) {
             index.insert(r, issue);
         }
@@ -868,6 +867,13 @@ fn declined(issue: &Issue) -> Option<&'static str> {
     // systems, and neither would win.
     if !issue.source_system.is_empty() && issue.source_system != "linear" {
         return Some("owned by another tracker");
+    }
+    // A ref with no system attached. It names something in a tracker we cannot
+    // identify — refs from every system share this one column — so creating a
+    // Linear issue for it would file work that already exists somewhere else, and
+    // overwriting the ref would destroy the only link back to it.
+    if issue.source_system.is_empty() && issue.external_ref.is_some() {
+        return Some("carries an external_ref with no source_system, so it is not assumed to be ours");
     }
     None
 }

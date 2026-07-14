@@ -239,6 +239,18 @@ impl Storage for SqliteStore {
                     qb.push(", external_ref = NULL");
                 }
             }
+            // The other half of the tracker join key. Clearing it writes `''`,
+            // not NULL: the column is NOT NULL, and `Issue::source_system` is a
+            // `String` whose empty value already means "no remote".
+            match &patch.source_system {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", source_system = ").push_bind(v.clone());
+                }
+                Field::Clear => {
+                    qb.push(", source_system = ''");
+                }
+            }
             if let Some(v) = patch.pinned {
                 qb.push(", pinned = ").push_bind(v);
             }
