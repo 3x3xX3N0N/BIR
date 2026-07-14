@@ -1,10 +1,11 @@
 //! Moving issues in and out, and the commands that need a commit graph.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
-use anyhow::{Context as _, Result};
-use bd_core::{Dependency, Issue, IssueFilter, Status};
+use anyhow::{Context as _, Result, bail};
+use bd_core::{Comment, Dependency, Issue, IssueFilter, Status};
 use bd_storage::{Field, IssuePatch};
 use serde_json::{Value, json};
 
@@ -13,6 +14,7 @@ use crate::cli::{
 };
 use crate::commands::{Cap, require_cap, stub};
 use crate::context::Ctx;
+use crate::exit::SilentExit;
 use crate::output::export_record;
 
 // ---------------------------------------------------------------------------
@@ -26,7 +28,19 @@ pub async fn export(ctx: &Ctx, a: ExportArgs) -> Result<()> {
     if a.open_only {
         f.statuses = vec![Status::Open, Status::InProgress];
     }
-    let issues = store.list_issues(&f).await?;
+    let mut issues = store.list_issues(&f).await?;
+
+    // `list_issues` returns columns, not relations: labels, edges, and comments
+    // all come back empty. That is the right trade for a listing and the wrong
+    // one for a backup, so they get hydrated here — an export that loses labels
+    // is not a backup.
+    //
+    // Labels arrive for the whole listing in a single query. Edges and comments
+    // still cost one apiece: the seam has no batched form of either, so that is
+    // the N+1 that remains, and it is bounded by the size of the export itself.
+    let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+    let mut labels: HashMap<String, Vec<String>> =
+        store.labels_of(&ids).await?.into_iter().collect();
 
     let mut w: Box<dyn Write> = match &a.output {
         Some(p) => Box::new(BufWriter::new(
@@ -35,21 +49,13 @@ pub async fn export(ctx: &Ctx, a: ExportArgs) -> Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout().lock())),
     };
 
-    for issue in issues {
-        // `list_issues` returns columns, not relations: labels, edges, and
-        // comments come back empty. That is the right trade for a listing and
-        // the wrong one for a backup, so re-read each issue in full here.
-        // `get_issue` is the only way to see an issue's labels — the seam has no
-        // per-issue label getter — and an export that loses labels is not a
-        // backup. One query per issue is a fine price for that.
-        let mut issue = store.get_issue(&issue.id).await?.unwrap_or(issue);
-        if issue.dependencies.is_empty() {
-            issue.dependencies = store.dependencies_of(&issue.id).await?;
-        }
-        if issue.comments.is_empty() {
-            issue.comments = store.list_comments(&issue.id).await?;
-        }
-        writeln!(w, "{}", serde_json::to_string(&export_record(&issue)?)?)?;
+    for issue in &mut issues {
+        // `labels_of` omits ids that carry no labels at all, so a miss is
+        // ordinary rather than an error.
+        issue.labels = labels.remove(&issue.id).unwrap_or_default();
+        issue.dependencies = store.dependencies_of(&issue.id).await?;
+        issue.comments = store.list_comments(&issue.id).await?;
+        writeln!(w, "{}", serde_json::to_string(&export_record(issue)?)?)?;
     }
     w.flush()?;
 
@@ -76,10 +82,11 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
     let mut updated = 0u64;
     let mut skipped = 0u64;
     let mut edges = 0u64;
-    let mut dropped_comments = 0u64;
-    // Two passes: edges can point forward, at an issue that appears later in the
-    // file. Adding them as we go would fail on a perfectly valid export.
-    let mut pending: Vec<Dependency> = Vec::new();
+    // Two passes. Edges and comments alike can name an issue that appears later
+    // in the file, and applying them as we go would fail on a perfectly valid
+    // export.
+    let mut pending_edges: Vec<Dependency> = Vec::new();
+    let mut pending_comments: Vec<Comment> = Vec::new();
 
     for (n, line) in reader.lines().enumerate() {
         let line = line?;
@@ -106,13 +113,8 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
         // their custom type is not our typo.
         issue.validate_for_import()?;
 
-        pending.extend(issue.dependencies.iter().cloned());
-        // Comments are *not* restored. `add_comment` mints a fresh id and
-        // attributes the comment to whoever is importing, so re-running an
-        // import would duplicate every comment and relabel its author. The seam
-        // has no comment upsert; until it does, idempotency wins — but say so
-        // out loud rather than dropping data in silence.
-        dropped_comments += issue.comments.len() as u64;
+        pending_edges.extend(issue.dependencies.iter().cloned());
+        pending_comments.extend(issue.comments.iter().cloned());
 
         if a.dry_run {
             if store.get_issue(&issue.id).await?.is_some() {
@@ -135,14 +137,26 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
         }
     }
 
+    let comments = pending_comments.len() as u64;
+
     if !a.dry_run {
-        for d in &pending {
+        for d in &pending_edges {
             match store.add_dependency(d).await {
                 Ok(()) => edges += 1,
                 // Re-importing the same file must be a no-op, not a failure.
                 Err(bd_storage::Error::AlreadyExists(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        for c in &pending_comments {
+            // `upsert_comment`, never `add_comment`: the latter mints a fresh id
+            // and stamps *the importer* as the author, so re-importing a file
+            // would duplicate every comment and misattribute all of them. Keying
+            // on the incoming id keeps import idempotent and the original author
+            // intact.
+            store.upsert_comment(c).await.with_context(|| {
+                format!("cannot import comment {} on issue {}", c.id, c.issue_id)
+            })?;
         }
         // A bulk upsert lands closures and edges that no single write path saw
         // in order. The blocked cache is a fixpoint over the whole graph, so it
@@ -156,19 +170,15 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
             "updated": updated,
             "skipped": skipped,
             "dependencies": edges,
-            "comments_not_imported": dropped_comments,
+            "comments": comments,
             "dry_run": a.dry_run,
         }))?;
     } else {
         let prefix = if a.dry_run { "Would import" } else { "Imported" };
         ctx.out.line(format!(
-            "{prefix}: {created} created, {updated} updated, {skipped} skipped, {edges} edge(s)"
+            "{prefix}: {created} created, {updated} updated, {skipped} skipped, \
+             {edges} edge(s), {comments} comment(s)"
         ));
-        if dropped_comments > 0 {
-            ctx.out.warn(format!(
-                "{dropped_comments} comment(s) were not imported (see PORT_STATUS.md: import has no comment upsert yet)"
-            ));
-        }
     }
     Ok(())
 }
@@ -249,6 +259,95 @@ pub async fn dolt(ctx: &Ctx, cmd: DoltCmd) -> Result<()> {
     stub(name, ctx)
 }
 
+/// Peer-to-peer sync: every peer keeps its own database and they exchange
+/// updates over remotes.
+///
+/// That is a remote capability, not a missing feature. A backend with no commit
+/// graph has nothing to push and nothing to pull, so on sqlite this is exit 2 —
+/// a final answer — and never exit 64, which would advertise it as work someone
+/// still owes you. (Upstream reaches the same conclusion from the other side:
+/// its federation commands require the Dolt backend.)
+pub async fn federation(ctx: &Ctx, cmd: FederationCmd) -> Result<()> {
+    let name = match cmd {
+        FederationCmd::Sync => "federation sync",
+        FederationCmd::Status => "federation status",
+        FederationCmd::AddPeer { .. } => "federation add-peer",
+        FederationCmd::RemovePeer { .. } => "federation remove-peer",
+        FederationCmd::ListPeers => "federation list-peers",
+    };
+    require_cap(ctx, name, Cap::Remote)?;
+    stub(name, ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Mail — a shim, not a feature
+// ---------------------------------------------------------------------------
+
+/// Env vars that name the mail provider, in the order upstream checks them.
+const MAIL_DELEGATE_ENV: [&str; 2] = ["BEADS_MAIL_DELEGATE", "BD_MAIL_DELEGATE"];
+const MAIL_DELEGATE_KEY: &str = "mail.delegate";
+
+/// `bd mail` delegates to whatever actually handles mail here.
+///
+/// Beads has no mailbox. Mail belongs to the orchestrator — but agents working
+/// in beads reach for `bd mail` anyway, so upstream bridges the gap by shelling
+/// out to a configured provider (`gt mail`, typically), and so do we.
+///
+/// The provider owns stdout, including under `--json`: a shim that reformatted
+/// its child's output would be lying about where the answer came from.
+pub async fn mail(ctx: &Ctx, id: Option<String>) -> Result<()> {
+    // Environment first, so a session can override a setting that is committed
+    // to the workspace. Only then open the store — an unset env var is the
+    // common case, but a store we never needed is a cost we never pay.
+    let delegate = match MAIL_DELEGATE_ENV
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+    {
+        Some(v) => v,
+        None => ctx
+            .store()
+            .await?
+            .get_config(MAIL_DELEGATE_KEY)
+            .await?
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no mail provider configured.\n\
+                     Set one with `bd config set {MAIL_DELEGATE_KEY} \"gt mail\"`, \
+                     or export {}.",
+                    MAIL_DELEGATE_ENV[0]
+                )
+            })?,
+    };
+
+    // Whitespace splitting, not a shell: the provider is a command line the user
+    // configured (`gt mail`), and handing it to a shell would make quoting and
+    // metacharacters in an argument someone else's problem.
+    let mut words = delegate.split_whitespace();
+    let program = words
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{MAIL_DELEGATE_KEY} is empty"))?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(words);
+    cmd.args(id.as_deref());
+
+    // Blocking on purpose: stdio is inherited, so the child owns the terminal
+    // for as long as it runs, and we have nothing to do until it is done.
+    let status = cmd
+        .status()
+        .with_context(|| format!("cannot run the mail provider `{delegate}`"))?;
+
+    match status.code() {
+        Some(0) => Ok(()),
+        // The provider already said whatever it had to say, on its own stdio.
+        // Carry its verdict out to the shell rather than flattening every
+        // failure to 1 — a caller distinguishing them is the point of the shim.
+        Some(code) => Err(SilentExit(code).into()),
+        None => bail!("the mail provider `{delegate}` was killed by a signal"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registered, not ported
 // ---------------------------------------------------------------------------
@@ -265,17 +364,24 @@ pub async fn tracker(ctx: &Ctx, tracker: &str, cmd: TrackerCmd) -> Result<()> {
     stub(&format!("{tracker} {verb}"), ctx)
 }
 
-pub async fn federation(ctx: &Ctx, cmd: FederationCmd) -> Result<()> {
-    let name = match cmd {
-        FederationCmd::Sync => "federation sync",
-        FederationCmd::Status => "federation status",
-        FederationCmd::AddPeer { .. } => "federation add-peer",
-        FederationCmd::RemovePeer { .. } => "federation remove-peer",
-        FederationCmd::ListPeers => "federation list-peers",
-    };
-    stub(name, ctx)
-}
-
+/// Multi-repo hydration: pull issues from sibling beads workspaces into this
+/// database so one query spans all of them.
+///
+/// Stubbed because two things it needs do not exist yet, and faking either would
+/// produce a command that succeeds while doing nothing:
+///
+/// 1. **A place to keep the list.** Upstream stores it in `.beads/config.yaml`
+///    under `repos:`. Our [`Config`](crate::context::Config) has no such field,
+///    and `Config::save` round-trips through the struct — so a `repos:` key
+///    written behind its back would survive exactly until the next `bd config`
+///    write silently dropped it. A registry that quietly deletes itself is worse
+///    than no registry.
+/// 2. **A second store.** `sync` has to read another workspace's database, and
+///    the seam hands out exactly one store, chosen by this workspace's locator.
+///    Opening a second one from here would mean naming a concrete backend
+///    outside the single place allowed to (storage rule 1).
+///
+/// Both are one-liners for whoever owns those files; neither is ours.
 pub async fn repo(ctx: &Ctx, cmd: RepoCmd) -> Result<()> {
     let name = match cmd {
         RepoCmd::Add { .. } => "repo add",
@@ -286,10 +392,18 @@ pub async fn repo(ctx: &Ctx, cmd: RepoCmd) -> Result<()> {
     stub(name, ctx)
 }
 
-pub async fn mail(ctx: &Ctx, _id: Option<String>) -> Result<()> {
-    stub("mail", ctx)
-}
-
+/// Publish a capability so other projects can depend on it: find the issue
+/// labelled `export:<capability>`, check it is closed, label it
+/// `provides:<capability>`.
+///
+/// The store can do every part of that today — `labels_all` pushes the lookup
+/// down, `add_label` does the write. What is missing is the *argument*: `bd
+/// ship` takes a mandatory `<capability>` (plus `--force` and `--dry-run`), and
+/// the command tree declares it as a bare `Ship` with no fields. There is no
+/// capability to ship, so there is nothing honest to do but say so.
+///
+/// See the report: this needs one `cli.rs` change and one `mod.rs` line, after
+/// which the body is about fifteen lines.
 pub async fn ship(ctx: &Ctx) -> Result<()> {
     stub("ship", ctx)
 }

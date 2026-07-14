@@ -137,8 +137,16 @@ fn unported_commands_exit_64_not_1() {
     // A workspace has to exist, or we would be testing the no-workspace path.
     fake_workspace(&tmp);
 
+    // `migrate`, not `gc` -- `gc` was a stub when this test was written and is
+    // not one any more. Pick an example that will *stay* a stub: `migrate` needs
+    // a schema version to migrate between, and this port does not have one yet.
+    //
+    // Note the failure this test is guarding against is subtle: `fake_workspace`
+    // writes a locator with no database behind it, so a command that opens the
+    // store dies with exit 1. That is exactly what a stub must NOT do -- the
+    // whole point is that "not built yet" stays distinguishable from "broke".
     let out = bd()
-        .args(["-C", tmp.to_str().unwrap(), "gc"])
+        .args(["-C", tmp.to_str().unwrap(), "migrate"])
         .output()
         .expect("run bd");
     assert_eq!(
@@ -149,13 +157,13 @@ fn unported_commands_exit_64_not_1() {
     );
 
     let out = bd()
-        .args(["-C", tmp.to_str().unwrap(), "--json", "gc"])
+        .args(["-C", tmp.to_str().unwrap(), "--json", "migrate"])
         .output()
         .expect("run bd");
     let doc: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("--json stub must emit JSON");
     assert_eq!(doc["error"], "not_implemented");
-    assert_eq!(doc["command"], "gc");
+    assert_eq!(doc["command"], "migrate");
 
     std::fs::remove_dir_all(&tmp).ok();
 }
