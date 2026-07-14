@@ -152,6 +152,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bd-core",
+ "bd-dolt",
  "bd-query",
  "bd-sqlite",
  "bd-storage",
@@ -163,9 +164,11 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

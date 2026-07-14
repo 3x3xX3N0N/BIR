@@ -47,13 +47,13 @@ pub async fn init(ctx: &Ctx, a: InitArgs) -> Result<()> {
     };
     guard_existing(ctx, &root, a.force)?;
 
-    if a.backend != Backend::Sqlite {
+    if !matches!(a.backend, Backend::Sqlite | Backend::Dolt) {
         // Not a capability gap — a backend this port has not built. Exit 64, so
         // a script can tell "come back later" from "never".
         return stub(&format!("init --backend={}", a.backend), ctx);
     }
 
-    let r = create_workspace(ctx, &root, a.prefix.clone()).await?;
+    let r = create_workspace(ctx, &root, a.prefix.clone(), a.backend).await?;
 
     if ctx.out.is_json() {
         ctx.out.json_value(&json!({
@@ -71,6 +71,12 @@ pub async fn init(ctx: &Ctx, a: InitArgs) -> Result<()> {
         ctx.out.line(format!("Issue ids will look like {}-a3f2", r.prefix));
     }
     Ok(())
+}
+
+/// A fresh workspace id. Same shape as the one `bd_sqlite::init` mints — it is
+/// how clones recognize each other, so the two backends must agree on it.
+fn new_workspace_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// What creating a workspace produced.
@@ -106,7 +112,12 @@ fn guard_existing(ctx: &Ctx, root: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn create_workspace(ctx: &Ctx, root: &Path, prefix: Option<String>) -> Result<InitReport> {
+async fn create_workspace(
+    ctx: &Ctx,
+    root: &Path,
+    prefix: Option<String>,
+    backend: Backend,
+) -> Result<InitReport> {
     let beads_dir = root.join(bd_storage::locator::BEADS_DIR);
     let prefix = prefix.unwrap_or_else(|| derive_prefix(root));
     let identity = Identity {
@@ -114,13 +125,49 @@ async fn create_workspace(ctx: &Ctx, root: &Path, prefix: Option<String>) -> Res
         session: ctx.identity.session.clone(),
     };
 
-    // `init` takes the project root and creates `.beads/` under it — including
-    // the locator, whose workspace_id it preserves across a re-init. Writing our
-    // own locator afterwards would rotate that id and fork the workspace from
-    // itself, so we read the one it wrote instead.
-    let store = bd_sqlite::init(root, &prefix, identity).await?;
-    store.close().await?;
-    let locator = Locator::load(&beads_dir)?;
+    let locator = match backend {
+        // `bd_sqlite::init` takes the project *root*, creates `.beads/` under it,
+        // and writes the locator itself — preserving the workspace_id across a
+        // re-init. Writing our own locator afterwards would rotate that id and
+        // fork the workspace from itself, so we read the one it wrote.
+        Backend::Sqlite => {
+            let store = bd_sqlite::init(root, &prefix, identity).await?;
+            store.close().await?;
+            Locator::load(&beads_dir)?
+        }
+        // `bd_dolt::init` takes the `.beads` directory — which *is* the dolt
+        // repository — and does not write a locator. So we write it, and we write
+        // it **first**: a `dolt init` that fails halfway must still leave a
+        // workspace that can say what it is, or `bd doctor` cannot diagnose it.
+        Backend::Dolt => {
+            // Before anything is written. A machine with no `dolt` must end up
+            // with no workspace at all, rather than a `.beads/` that says "I am a
+            // dolt workspace" over an empty hole. (Past this point a failure
+            // *does* leave the locator, deliberately: a half-initialized
+            // workspace that can still say what it is, is one `bd doctor` can
+            // diagnose.)
+            if !bd_dolt::dolt_available() {
+                bail!(
+                    "`bd init --backend=dolt` needs the `dolt` binary on PATH.\n\
+                     Install it from https://github.com/dolthub/dolt (`brew install dolt`, \
+                     `winget install DoltHub.Dolt`), or use the default sqlite backend."
+                );
+            }
+            std::fs::create_dir_all(&beads_dir)?;
+            let existing = Locator::load(&beads_dir).ok();
+            let locator = Locator::new(
+                Backend::Dolt,
+                // Preserve the id across `--force`, for the same reason sqlite does.
+                existing.map_or_else(new_workspace_id, |l| l.workspace_id),
+                &beads_dir,
+            );
+            locator.save()?;
+            let store = bd_dolt::init(&beads_dir, &prefix, identity).await?;
+            store.close().await?;
+            locator
+        }
+        other => bail!("init --backend={other} is not implemented"),
+    };
 
     let config = Config {
         prefix: Some(prefix.clone()),
@@ -130,7 +177,7 @@ async fn create_workspace(ctx: &Ctx, root: &Path, prefix: Option<String>) -> Res
 
     Ok(InitReport {
         beads_dir,
-        backend: Backend::Sqlite,
+        backend,
         prefix,
         workspace_id: locator.workspace_id,
     })
@@ -768,7 +815,7 @@ pub async fn bootstrap(ctx: &Ctx) -> Result<()> {
     let root = project_root(ctx);
     let report = match ctx.locator.is_some() {
         true => None,
-        false => Some(create_workspace(ctx, &root, None).await?),
+        false => Some(create_workspace(ctx, &root, None, Backend::Sqlite).await?),
     };
     let applied = apply_recipes(&root, &detect_recipes(&root))?;
 

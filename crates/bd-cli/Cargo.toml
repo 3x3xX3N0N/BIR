@@ -17,6 +17,7 @@ path = "src/main.rs"
 bd-core = { workspace = true }
 bd-query = { workspace = true }
 bd-sqlite = { workspace = true }
+bd-dolt = { workspace = true }
 bd-storage = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -26,9 +27,20 @@ clap_complete = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# So a test can corrupt the database *behind the store's back* — which is the
+# only way to produce a stale `is_blocked` cache, because every write path in
+# this port recomputes it. Without this, the check that guards the single most
+# dangerous failure in the system (a silently lying `bd ready`) can only be
+# unit-tested; the end-to-end test has to skip, and a skipping test reports as
+# coverage. `deps_cli.rs` already had one such false green.
+sqlx = { workspace = true }
+tokio = { workspace = true }

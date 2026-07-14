@@ -254,15 +254,20 @@ impl Ctx {
 async fn open_store(locator: &Locator, identity: Identity) -> Result<Box<dyn Storage>> {
     match locator.backend {
         Backend::Sqlite => Ok(bd_sqlite::open(locator, identity).await?),
+        // Dolt starts (or adopts) a `dolt sql-server` and speaks MySQL to it.
+        // Everything above this line still only sees `Box<dyn Storage>` — the
+        // difference is that this one answers `Some` from the capability
+        // accessors, which is what turns `bd branch` from "exit 2, sqlite has no
+        // commit graph" into a working command.
+        Backend::Dolt => Ok(bd_dolt::open(locator, identity).await?),
         // Not "unknown backend" — a real backend this port has not built. Say so.
         other => Err(bd_storage::Error::unsupported_hint(
             "open",
             match other {
-                Backend::Dolt => "dolt",
                 Backend::Postgres => "postgres",
                 _ => "mysql",
             },
-            "this port only implements the sqlite backend so far",
+            "this port implements the sqlite and dolt backends",
         )
         .into()),
     }

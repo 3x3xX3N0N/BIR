@@ -617,17 +617,26 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(CAP_MS))
 }
 
+/// What a running server left on disk so the next `bd` can find it.
+///
+/// Public because `bd doctor` must read exactly this, from exactly this path.
+/// It had its own copy of both for one wave — a different filename and a
+/// different layout — which meant its checks inspected paths that never existed
+/// and reported a clean bill of health for a workspace they had not looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct PidFile {
-    pid: u32,
-    port: u16,
+pub struct PidFile {
+    pub pid: u32,
+    pub port: u16,
 }
 
-fn pidfile_path(dir: &Path) -> PathBuf {
+pub fn pidfile_path(dir: &Path) -> PathBuf {
     dir.join(PID_FILE)
 }
 
-fn read_pidfile(dir: &Path) -> Option<PidFile> {
+/// The recorded server for the workspace in `dir`, if it left a record.
+///
+/// A truncated or hand-edited file reads as absent, not as an error.
+pub fn read_pidfile(dir: &Path) -> Option<PidFile> {
     let body = std::fs::read_to_string(pidfile_path(dir)).ok()?;
     // A truncated or hand-edited file is a stale file, not an error: we are about
     // to probe the port anyway, and failing `bd` over unparseable scratch state
