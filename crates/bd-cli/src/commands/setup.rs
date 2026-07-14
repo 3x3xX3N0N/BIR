@@ -5,7 +5,8 @@ use bd_storage::{Backend, Identity, Locator};
 use clap_complete::Shell;
 use serde_json::json;
 
-use crate::cli::{ConfigCmd, InitArgs};
+use crate::cli::{ConfigCmd, HooksCmd, InitArgs, MetricsCmd, UpgradeCmd};
+use crate::commands::stub;
 use crate::context::{Config, Ctx};
 
 /// The other place a concrete backend may be named (see [`crate::context`]).
@@ -44,7 +45,7 @@ pub async fn init(ctx: &Ctx, a: InitArgs) -> Result<()> {
     if a.backend != Backend::Sqlite {
         // Not a capability gap — a backend this port has not built. Exit 64, so
         // a script can tell "come back later" from "never".
-        return crate::commands::stub(&format!("init --backend={}", a.backend), ctx);
+        return stub(&format!("init --backend={}", a.backend), ctx);
     }
 
     let prefix = a.prefix.clone().unwrap_or_else(|| derive_prefix(&root));
@@ -165,8 +166,60 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             }
             Ok(())
         }
-        ConfigCmd::Unset { .. } => crate::commands::stub("config unset", ctx),
-        ConfigCmd::Validate => crate::commands::stub("config validate", ctx),
-        ConfigCmd::Show => crate::commands::stub("config show", ctx),
+        ConfigCmd::Unset { .. } => stub("config unset", ctx),
+        ConfigCmd::Validate => stub("config validate", ctx),
+        ConfigCmd::Show => stub("config show", ctx),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registered, not ported
+// ---------------------------------------------------------------------------
+
+pub async fn bootstrap(ctx: &Ctx) -> Result<()> {
+    stub("bootstrap", ctx)
+}
+
+pub async fn setup(ctx: &Ctx) -> Result<()> {
+    stub("setup", ctx)
+}
+
+pub async fn onboard(ctx: &Ctx) -> Result<()> {
+    stub("onboard", ctx)
+}
+
+pub async fn quickstart(ctx: &Ctx) -> Result<()> {
+    stub("quickstart", ctx)
+}
+
+pub async fn prime(ctx: &Ctx) -> Result<()> {
+    stub("prime", ctx)
+}
+
+pub async fn hooks(ctx: &Ctx, cmd: HooksCmd) -> Result<()> {
+    let name = match cmd {
+        HooksCmd::Install => "hooks install",
+        HooksCmd::Uninstall => "hooks uninstall",
+        HooksCmd::List => "hooks list",
+        HooksCmd::Run { .. } => "hooks run",
+    };
+    stub(name, ctx)
+}
+
+pub async fn upgrade(ctx: &Ctx, cmd: UpgradeCmd) -> Result<()> {
+    let name = match cmd {
+        UpgradeCmd::Status => "upgrade status",
+        UpgradeCmd::Review => "upgrade review",
+        UpgradeCmd::Ack => "upgrade ack",
+    };
+    stub(name, ctx)
+}
+
+pub async fn metrics(ctx: &Ctx, cmd: MetricsCmd) -> Result<()> {
+    let name = match cmd {
+        MetricsCmd::On => "metrics on",
+        MetricsCmd::Off => "metrics off",
+        MetricsCmd::Example => "metrics example",
+    };
+    stub(name, ctx)
 }

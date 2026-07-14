@@ -113,6 +113,15 @@ pub fn require_cap(ctx: &Ctx, cmd: &str, cap: Cap) -> Result<()> {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// One arm per command, and nothing else: unpack the args clap parsed and hand
+/// them to the family module that owns the command.
+///
+/// Every handler is `async` even where its body could not possibly await —
+/// including the stubs. That is the point. A stub that graduates into a real
+/// command *will* need the store, the store is async, and if the stub had been
+/// sync the promotion would have had to come back here to add a `.await`. Then
+/// this file is on the critical path of every agent at once, which is the
+/// collision this arrangement exists to prevent.
 pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
     use Commands as C;
     match cmd {
@@ -124,29 +133,29 @@ pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
         C::Close(a) => issues::close(ctx, a).await,
         C::Reopen { ids } => issues::reopen(ctx, &ids).await,
         C::Delete { ids } => issues::delete(ctx, &ids).await,
+        C::Edit { id } => issues::edit(ctx, &id).await,
+        C::Restore { id } => issues::restore(ctx, &id).await,
+        C::Rename { id, title } => issues::rename(ctx, &id, &title).await,
         C::Assign { id, assignee } => issues::assign(ctx, &id, &assignee).await,
         C::Unclaim { id } => issues::unclaim(ctx, &id).await,
         C::Priority { id, priority } => issues::priority(ctx, &id, priority).await,
-        C::Comment { id, text } => issues::comment(ctx, &id, &text.join(" ")).await,
-        C::Comments { cmd } => issues::comments(ctx, cmd).await,
+        C::Tag { id, tags } => issues::tag(ctx, &id, &tags).await,
         C::Label { cmd } => issues::label(ctx, cmd).await,
-        C::Edit { .. } => stub("edit", ctx),
-        C::Restore { .. } => stub("restore", ctx),
-        C::Rename { .. } => stub("rename", ctx),
-        C::Tag { .. } => stub("tag", ctx),
-        C::Note { .. } => stub("note", ctx),
+        C::Comment { id, text } => issues::comment(ctx, &id, &text).await,
+        C::Comments { cmd } => issues::comments(ctx, cmd).await,
+        C::Note { id, text } => issues::note(ctx, &id, &text).await,
         C::Defer { id, until } => issues::defer(ctx, &id, until).await,
         C::Undefer { id } => issues::undefer(ctx, &id).await,
-        C::Duplicate { .. } => stub("duplicate", ctx),
-        C::Supersede { .. } => stub("supersede", ctx),
-        C::Link { .. } => stub("link", ctx),
-        C::Heartbeat { .. } => stub("heartbeat", ctx),
-        C::State { .. } => stub("state", ctx),
-        C::SetState { .. } => stub("set-state", ctx),
-        C::Statuses => stub("statuses", ctx),
-        C::Types => stub("types", ctx),
-        C::Promote { .. } => stub("promote", ctx),
-        C::Batch { .. } => stub("batch", ctx),
+        C::Duplicate { id, of } => issues::duplicate(ctx, &id, &of).await,
+        C::Supersede { id, with } => issues::supersede(ctx, &id, &with).await,
+        C::Link { from, to, link_type } => issues::link(ctx, &from, &to, link_type).await,
+        C::Heartbeat { id } => issues::heartbeat(ctx, &id).await,
+        C::State { id } => issues::state(ctx, &id).await,
+        C::SetState { id, state } => issues::set_state(ctx, &id, &state).await,
+        C::Statuses => issues::statuses(ctx).await,
+        C::Types => issues::types(ctx).await,
+        C::Promote { id } => issues::promote(ctx, &id).await,
+        C::Batch { file } => issues::batch(ctx, file).await,
 
         // ----- Views -----
         C::List(a) => views::list(ctx, a).await,
@@ -157,145 +166,86 @@ pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
         C::Count(a) => views::count(ctx, a).await,
         C::Status => views::status(ctx).await,
         C::History { id } => views::history(ctx, &id).await,
+        C::Children { id } => views::children(ctx, &id).await,
+        C::Epic { cmd } => views::epic(ctx, cmd).await,
+        C::Info => views::info(ctx).await,
+        C::Stale { older_than } => views::stale(ctx, &older_than).await,
+        C::Orphans => views::orphans(ctx).await,
+        C::Duplicates => views::duplicates(ctx).await,
+        C::FindDuplicates { id } => views::find_duplicates(ctx, &id).await,
+        C::Lint => views::lint(ctx).await,
+        C::Diff { from, to } => views::diff(ctx, &from, &to).await,
+        C::Sql { query } => views::sql(ctx, &query).await,
+        C::Kv { cmd } => views::kv(ctx, cmd).await,
+        C::Audit { cmd } => views::audit(ctx, cmd).await,
         C::Where => views::where_(ctx),
-        C::Children { .. } => stub("children", ctx),
-        C::Epic { cmd } => match cmd {
-            crate::cli::EpicCmd::Status => stub("epic status", ctx),
-            crate::cli::EpicCmd::CloseEligible => stub("epic close-eligible", ctx),
-        },
-        C::Info => stub("info", ctx),
-        C::Stale { .. } => stub("stale", ctx),
-        C::Orphans => stub("orphans", ctx),
-        C::Duplicates => stub("duplicates", ctx),
-        C::FindDuplicates { .. } => stub("find-duplicates", ctx),
-        C::Lint => stub("lint", ctx),
-        C::Diff { from, to } => views::diff(ctx, &from, &to),
-        C::Sql { .. } => stub("sql", ctx),
-        C::Kv { cmd } => {
-            use crate::cli::KvCmd as K;
-            match cmd {
-                K::Set { .. } => stub("kv set", ctx),
-                K::Get { .. } => stub("kv get", ctx),
-                K::Clear { .. } => stub("kv clear", ctx),
-                K::List => stub("kv list", ctx),
-            }
-        }
-        C::Audit { cmd } => {
-            use crate::cli::AuditCmd as A;
-            match cmd {
-                A::Record { .. } => stub("audit record", ctx),
-                A::Label { .. } => stub("audit label", ctx),
-            }
-        }
-        C::Context => stub("context", ctx),
-        C::Ping => stub("ping", ctx),
+        C::Context => views::context(ctx).await,
+        C::Ping => views::ping(ctx).await,
 
         // ----- Deps -----
         C::Dep { cmd } => deps::dep(ctx, cmd).await,
-        C::Graph { cmd } => match cmd {
-            Some(crate::cli::GraphCmd::Check) => stub("graph check", ctx),
-            None => stub("graph", ctx),
-        },
-        C::Flatten { .. } => stub("flatten", ctx),
+        C::Graph { cmd } => deps::graph(ctx, cmd).await,
+        C::Flatten { id } => deps::flatten(ctx, &id).await,
         C::RecomputeBlocked => deps::recompute_blocked(ctx).await,
 
         // ----- Sync -----
+        C::Dolt { cmd } => sync::dolt(ctx, cmd).await,
+        C::Vc { cmd } => sync::vc(ctx, cmd).await,
+        C::Branch { name } => sync::branch(ctx, name).await,
+        C::Federation { cmd } => sync::federation(ctx, cmd).await,
+        C::Repo { cmd } => sync::repo(ctx, cmd).await,
         C::Export(a) => sync::export(ctx, a).await,
         C::Import(a) => sync::import(ctx, a).await,
-        C::Dolt { cmd } => sync::dolt(ctx, cmd),
-        C::Vc { cmd } => sync::vc(ctx, cmd),
-        C::Branch { .. } => sync::branch(ctx),
-        C::Federation { cmd } => {
-            use crate::cli::FederationCmd as F;
-            match cmd {
-                F::Sync => stub("federation sync", ctx),
-                F::Status => stub("federation status", ctx),
-                F::AddPeer { .. } => stub("federation add-peer", ctx),
-                F::RemovePeer { .. } => stub("federation remove-peer", ctx),
-                F::ListPeers => stub("federation list-peers", ctx),
-            }
-        }
-        C::Repo { cmd } => {
-            use crate::cli::RepoCmd as R;
-            match cmd {
-                R::Add { .. } => stub("repo add", ctx),
-                R::Remove { .. } => stub("repo remove", ctx),
-                R::List => stub("repo list", ctx),
-                R::Sync => stub("repo sync", ctx),
-            }
-        }
-        C::Ado { cmd } => sync::tracker(ctx, "ado", cmd),
-        C::Jira { cmd } => sync::tracker(ctx, "jira", cmd),
-        C::Linear { cmd } => sync::tracker(ctx, "linear", cmd),
-        C::Github { cmd } => sync::tracker(ctx, "github", cmd),
-        C::Gitlab { cmd } => sync::tracker(ctx, "gitlab", cmd),
-        C::Notion { cmd } => sync::tracker(ctx, "notion", cmd),
-        C::Mail { .. } => stub("mail", ctx),
-        C::Ship => stub("ship", ctx),
+        C::Ado { cmd } => sync::tracker(ctx, "ado", cmd).await,
+        C::Jira { cmd } => sync::tracker(ctx, "jira", cmd).await,
+        C::Linear { cmd } => sync::tracker(ctx, "linear", cmd).await,
+        C::Github { cmd } => sync::tracker(ctx, "github", cmd).await,
+        C::Gitlab { cmd } => sync::tracker(ctx, "gitlab", cmd).await,
+        C::Notion { cmd } => sync::tracker(ctx, "notion", cmd).await,
+        C::Mail { id } => sync::mail(ctx, id).await,
+        C::Ship => sync::ship(ctx).await,
 
         // ----- Setup -----
         C::Init(a) => setup::init(ctx, a).await,
-        C::Version => setup::version(ctx),
-        C::Completion { shell } => setup::completion(shell),
+        C::Bootstrap => setup::bootstrap(ctx).await,
+        C::Setup => setup::setup(ctx).await,
+        C::Onboard => setup::onboard(ctx).await,
+        C::Quickstart => setup::quickstart(ctx).await,
+        C::Prime => setup::prime(ctx).await,
+        C::Hooks { cmd } => setup::hooks(ctx, cmd).await,
         C::Config { cmd } => setup::config(ctx, cmd).await,
-        C::Bootstrap => stub("bootstrap", ctx),
-        C::Setup => stub("setup", ctx),
-        C::Onboard => stub("onboard", ctx),
-        C::Quickstart => stub("quickstart", ctx),
-        C::Prime => stub("prime", ctx),
-        C::Hooks { cmd } => {
-            use crate::cli::HooksCmd as H;
-            match cmd {
-                H::Install => stub("hooks install", ctx),
-                H::Uninstall => stub("hooks uninstall", ctx),
-                H::List => stub("hooks list", ctx),
-                H::Run { .. } => stub("hooks run", ctx),
-            }
-        }
-        C::Upgrade { cmd } => {
-            use crate::cli::UpgradeCmd as U;
-            match cmd {
-                U::Status => stub("upgrade status", ctx),
-                U::Review => stub("upgrade review", ctx),
-                U::Ack => stub("upgrade ack", ctx),
-            }
-        }
-        C::Metrics { cmd } => {
-            use crate::cli::MetricsCmd as M;
-            match cmd {
-                M::On => stub("metrics on", ctx),
-                M::Off => stub("metrics off", ctx),
-                M::Example => stub("metrics example", ctx),
-            }
-        }
+        C::Upgrade { cmd } => setup::upgrade(ctx, cmd).await,
+        C::Version => setup::version(ctx),
+        C::Metrics { cmd } => setup::metrics(ctx, cmd).await,
+        C::Completion { shell } => setup::completion(shell),
 
         // ----- Maintenance -----
-        C::Doctor => maintenance::doctor(ctx),
-        C::Preflight => stub("preflight", ctx),
-        C::Gc => stub("gc", ctx),
-        C::Purge { .. } => stub("purge", ctx),
-        C::Prune => stub("prune", ctx),
-        C::Compact => stub("compact", ctx),
-        C::Backup { cmd } => maintenance::backup(ctx, cmd),
-        C::Admin { cmd } => maintenance::admin(ctx, cmd),
-        C::Migrate => stub("migrate", ctx),
-        C::RenamePrefix { .. } => stub("rename-prefix", ctx),
-        C::Reclaim => stub("reclaim", ctx),
-        C::Worktree { cmd } => maintenance::worktree(ctx, cmd),
-        C::MergeSlot { cmd } => maintenance::merge_slot(ctx, cmd),
+        C::Doctor => maintenance::doctor(ctx).await,
+        C::Preflight => maintenance::preflight(ctx).await,
+        C::Gc => maintenance::gc(ctx).await,
+        C::Purge { older_than } => maintenance::purge(ctx, &older_than).await,
+        C::Prune => maintenance::prune(ctx).await,
+        C::Compact => maintenance::compact(ctx).await,
+        C::Backup { cmd } => maintenance::backup(ctx, cmd).await,
+        C::Admin { cmd } => maintenance::admin(ctx, cmd).await,
+        C::Migrate => maintenance::migrate(ctx).await,
+        C::RenamePrefix { from, to } => maintenance::rename_prefix(ctx, &from, &to).await,
+        C::Reclaim => maintenance::reclaim(ctx).await,
+        C::Worktree { cmd } => maintenance::worktree(ctx, cmd).await,
+        C::MergeSlot { cmd } => maintenance::merge_slot(ctx, cmd).await,
 
         // ----- Advanced -----
-        C::Mol { cmd } => advanced::mol(ctx, cmd),
-        C::Formula { cmd } => advanced::formula(ctx, cmd),
-        C::Cook { .. } => stub("cook", ctx),
-        C::Swarm { cmd } => advanced::swarm(ctx, cmd),
-        C::Gate { cmd } => advanced::gate(ctx, cmd),
-        C::Rules { cmd } => advanced::rules(ctx, cmd),
-        C::Todo { cmd } => advanced::todo(ctx, cmd),
-        C::Human { cmd } => advanced::human(ctx, cmd),
-        C::Remember { .. } => stub("remember", ctx),
-        C::Memories => stub("memories", ctx),
-        C::Forget { .. } => stub("forget", ctx),
-        C::Recall { .. } => stub("recall", ctx),
+        C::Mol { cmd } => advanced::mol(ctx, cmd).await,
+        C::Formula { cmd } => advanced::formula(ctx, cmd).await,
+        C::Cook { formula } => advanced::cook(ctx, formula).await,
+        C::Swarm { cmd } => advanced::swarm(ctx, cmd).await,
+        C::Gate { cmd } => advanced::gate(ctx, cmd).await,
+        C::Rules { cmd } => advanced::rules(ctx, cmd).await,
+        C::Todo { cmd } => advanced::todo(ctx, cmd).await,
+        C::Human { cmd } => advanced::human(ctx, cmd).await,
+        C::Remember { text } => advanced::remember(ctx, &text).await,
+        C::Memories => advanced::memories(ctx).await,
+        C::Forget { id } => advanced::forget(ctx, &id).await,
+        C::Recall { text } => advanced::recall(ctx, &text).await,
     }
 }

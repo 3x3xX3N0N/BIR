@@ -8,7 +8,9 @@ use bd_core::{Dependency, Issue, IssueFilter, Status};
 use bd_storage::{Field, IssuePatch};
 use serde_json::{Value, json};
 
-use crate::cli::{DoltCmd, DoltRemoteCmd, ExportArgs, ImportArgs, TrackerCmd, VcCmd};
+use crate::cli::{
+    DoltCmd, DoltRemoteCmd, ExportArgs, FederationCmd, ImportArgs, RepoCmd, TrackerCmd, VcCmd,
+};
 use crate::commands::{Cap, require_cap, stub};
 use crate::context::Ctx;
 use crate::output::export_record;
@@ -204,12 +206,15 @@ fn patch_from(i: &Issue) -> IssuePatch {
 // Commands that need a commit graph
 // ---------------------------------------------------------------------------
 
-pub fn branch(ctx: &Ctx) -> Result<()> {
+/// With a name it switches branches, without one it lists them. Either way it
+/// wants a commit graph, so the capability check comes first — on sqlite this
+/// is exit 2 (an honest no), never exit 64.
+pub async fn branch(ctx: &Ctx, _name: Option<String>) -> Result<()> {
     require_cap(ctx, "branch", Cap::VersionControl)?;
     stub("branch", ctx)
 }
 
-pub fn vc(ctx: &Ctx, cmd: VcCmd) -> Result<()> {
+pub async fn vc(ctx: &Ctx, cmd: VcCmd) -> Result<()> {
     let name = match cmd {
         VcCmd::Merge { .. } => "vc merge",
         VcCmd::Commit { .. } => "vc commit",
@@ -219,7 +224,7 @@ pub fn vc(ctx: &Ctx, cmd: VcCmd) -> Result<()> {
     stub(name, ctx)
 }
 
-pub fn dolt(ctx: &Ctx, cmd: DoltCmd) -> Result<()> {
+pub async fn dolt(ctx: &Ctx, cmd: DoltCmd) -> Result<()> {
     // Every `bd dolt` subcommand presupposes the dolt backend, so the honest
     // answer on a sqlite workspace is the capability message, not "unbuilt".
     let (name, cap) = match &cmd {
@@ -244,7 +249,13 @@ pub fn dolt(ctx: &Ctx, cmd: DoltCmd) -> Result<()> {
     stub(name, ctx)
 }
 
-pub fn tracker(ctx: &Ctx, tracker: &str, cmd: TrackerCmd) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Registered, not ported
+// ---------------------------------------------------------------------------
+
+/// Every external tracker gets the same four verbs, so they get one handler.
+/// The trackers themselves land in `integrations/`, one file each.
+pub async fn tracker(ctx: &Ctx, tracker: &str, cmd: TrackerCmd) -> Result<()> {
     let verb = match cmd {
         TrackerCmd::Sync => "sync",
         TrackerCmd::Status => "status",
@@ -252,4 +263,33 @@ pub fn tracker(ctx: &Ctx, tracker: &str, cmd: TrackerCmd) -> Result<()> {
         TrackerCmd::Pull => "pull",
     };
     stub(&format!("{tracker} {verb}"), ctx)
+}
+
+pub async fn federation(ctx: &Ctx, cmd: FederationCmd) -> Result<()> {
+    let name = match cmd {
+        FederationCmd::Sync => "federation sync",
+        FederationCmd::Status => "federation status",
+        FederationCmd::AddPeer { .. } => "federation add-peer",
+        FederationCmd::RemovePeer { .. } => "federation remove-peer",
+        FederationCmd::ListPeers => "federation list-peers",
+    };
+    stub(name, ctx)
+}
+
+pub async fn repo(ctx: &Ctx, cmd: RepoCmd) -> Result<()> {
+    let name = match cmd {
+        RepoCmd::Add { .. } => "repo add",
+        RepoCmd::Remove { .. } => "repo remove",
+        RepoCmd::List => "repo list",
+        RepoCmd::Sync => "repo sync",
+    };
+    stub(name, ctx)
+}
+
+pub async fn mail(ctx: &Ctx, _id: Option<String>) -> Result<()> {
+    stub("mail", ctx)
+}
+
+pub async fn ship(ctx: &Ctx) -> Result<()> {
+    stub("ship", ctx)
 }

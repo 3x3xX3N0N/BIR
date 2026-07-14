@@ -4,7 +4,11 @@ use anyhow::Result;
 use bd_core::{Issue, IssueFilter, Status};
 use serde_json::json;
 
-use crate::cli::{BlockedArgs, CountArgs, FilterArgs, ListArgs, QueryArgs, ReadyArgs, SearchArgs};
+use crate::cli::{
+    AuditCmd, BlockedArgs, CountArgs, EpicCmd, FilterArgs, KvCmd, ListArgs, QueryArgs, ReadyArgs,
+    SearchArgs,
+};
+use crate::commands::{Cap, require_cap, stub};
 use crate::context::Ctx;
 
 /// The statuses `bd list` shows when you do not ask for any.
@@ -175,9 +179,9 @@ pub async fn history(ctx: &Ctx, id: &str) -> Result<()> {
 /// backend without a commit graph has no refs to diff.
 ///
 /// [`HistoryViewer`]: bd_storage::HistoryViewer
-pub fn diff(ctx: &Ctx, _from: &str, _to: &str) -> Result<()> {
-    crate::commands::require_cap(ctx, "diff", crate::commands::Cap::History)?;
-    crate::commands::stub("diff", ctx)
+pub async fn diff(ctx: &Ctx, _from: &str, _to: &str) -> Result<()> {
+    require_cap(ctx, "diff", Cap::History)?;
+    stub("diff", ctx)
 }
 
 /// Where the workspace is, and who beads thinks you are. Needs no database,
@@ -198,4 +202,74 @@ pub fn where_(ctx: &Ctx) -> Result<()> {
     ctx.out.line(format!("backend:   {}", loc.backend));
     ctx.out.line(format!("actor:     {}", ctx.identity.actor));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registered, not ported
+// ---------------------------------------------------------------------------
+
+pub async fn children(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("children", ctx)
+}
+
+pub async fn epic(ctx: &Ctx, cmd: EpicCmd) -> Result<()> {
+    let name = match cmd {
+        EpicCmd::Status => "epic status",
+        EpicCmd::CloseEligible => "epic close-eligible",
+    };
+    stub(name, ctx)
+}
+
+pub async fn info(ctx: &Ctx) -> Result<()> {
+    stub("info", ctx)
+}
+
+pub async fn stale(ctx: &Ctx, _older_than: &str) -> Result<()> {
+    stub("stale", ctx)
+}
+
+pub async fn orphans(ctx: &Ctx) -> Result<()> {
+    stub("orphans", ctx)
+}
+
+pub async fn duplicates(ctx: &Ctx) -> Result<()> {
+    stub("duplicates", ctx)
+}
+
+pub async fn find_duplicates(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("find-duplicates", ctx)
+}
+
+pub async fn lint(ctx: &Ctx) -> Result<()> {
+    stub("lint", ctx)
+}
+
+pub async fn sql(ctx: &Ctx, _query: &str) -> Result<()> {
+    stub("sql", ctx)
+}
+
+pub async fn kv(ctx: &Ctx, cmd: KvCmd) -> Result<()> {
+    let name = match cmd {
+        KvCmd::Set { .. } => "kv set",
+        KvCmd::Get { .. } => "kv get",
+        KvCmd::Clear { .. } => "kv clear",
+        KvCmd::List => "kv list",
+    };
+    stub(name, ctx)
+}
+
+pub async fn audit(ctx: &Ctx, cmd: AuditCmd) -> Result<()> {
+    let name = match cmd {
+        AuditCmd::Record { .. } => "audit record",
+        AuditCmd::Label { .. } => "audit label",
+    };
+    stub(name, ctx)
+}
+
+pub async fn context(ctx: &Ctx) -> Result<()> {
+    stub("context", ctx)
+}
+
+pub async fn ping(ctx: &Ctx) -> Result<()> {
+    stub("ping", ctx)
 }

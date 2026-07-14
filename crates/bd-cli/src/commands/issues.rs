@@ -1,12 +1,15 @@
 //! Creating, changing, and closing beads.
 
+use std::path::PathBuf;
+
 use anyhow::{Result, bail};
-use bd_core::{Dependency, Issue, IssueType, Priority};
+use bd_core::{Dependency, DependencyType, Issue, IssueType, Priority};
 use bd_storage::{Field, IssuePatch};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::cli::{CloseArgs, CommentsCmd, CreateArgs, LabelCmd, QuickArgs, UpdateArgs};
+use crate::commands::stub;
 use crate::context::Ctx;
 use crate::output::issue_json;
 
@@ -347,10 +350,12 @@ pub async fn priority(ctx: &Ctx, id: &str, priority: Priority) -> Result<()> {
     Ok(())
 }
 
-pub async fn comment(ctx: &Ctx, id: &str, text: &str) -> Result<()> {
+/// The text arrives as words, not as a string: clap collects a trailing
+/// `Vec<String>` so that `bd comment x-1 needs a rebase` works unquoted.
+pub async fn comment(ctx: &Ctx, id: &str, text: &[String]) -> Result<()> {
     ctx.ensure_writable("comment")?;
     let store = ctx.store().await?;
-    let c = store.add_comment(id, text).await?;
+    let c = store.add_comment(id, &text.join(" ")).await?;
     if ctx.out.is_json() {
         ctx.out.json_value(&c)?;
     } else {
@@ -366,7 +371,7 @@ pub async fn comments(ctx: &Ctx, cmd: CommentsCmd) -> Result<()> {
             let cs = store.list_comments(&id).await?;
             ctx.out.comments(&cs)
         }
-        CommentsCmd::Add { id, text } => comment(ctx, &id, &text.join(" ")).await,
+        CommentsCmd::Add { id, text } => comment(ctx, &id, &text).await,
     }
 }
 
@@ -439,6 +444,78 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
             }
             Ok(())
         }
-        LabelCmd::Propagate { .. } => crate::commands::stub("label propagate", ctx),
+        LabelCmd::Propagate { id: _ } => stub("label propagate", ctx),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registered, not ported
+// ---------------------------------------------------------------------------
+//
+// The arguments are already threaded through from the command tree, so filling
+// one of these in is writing a body — not touching the dispatch.
+
+pub async fn edit(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("edit", ctx)
+}
+
+pub async fn restore(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("restore", ctx)
+}
+
+pub async fn rename(ctx: &Ctx, _id: &str, _title: &str) -> Result<()> {
+    stub("rename", ctx)
+}
+
+pub async fn tag(ctx: &Ctx, _id: &str, _tags: &[String]) -> Result<()> {
+    stub("tag", ctx)
+}
+
+pub async fn note(ctx: &Ctx, _id: &str, _text: &[String]) -> Result<()> {
+    stub("note", ctx)
+}
+
+pub async fn duplicate(ctx: &Ctx, _id: &str, _of: &str) -> Result<()> {
+    stub("duplicate", ctx)
+}
+
+pub async fn supersede(ctx: &Ctx, _id: &str, _with: &str) -> Result<()> {
+    stub("supersede", ctx)
+}
+
+pub async fn link(
+    ctx: &Ctx,
+    _from: &str,
+    _to: &str,
+    _link_type: Option<DependencyType>,
+) -> Result<()> {
+    stub("link", ctx)
+}
+
+pub async fn heartbeat(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("heartbeat", ctx)
+}
+
+pub async fn state(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("state", ctx)
+}
+
+pub async fn set_state(ctx: &Ctx, _id: &str, _state: &str) -> Result<()> {
+    stub("set-state", ctx)
+}
+
+pub async fn statuses(ctx: &Ctx) -> Result<()> {
+    stub("statuses", ctx)
+}
+
+pub async fn types(ctx: &Ctx) -> Result<()> {
+    stub("types", ctx)
+}
+
+pub async fn promote(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("promote", ctx)
+}
+
+pub async fn batch(ctx: &Ctx, _file: Option<PathBuf>) -> Result<()> {
+    stub("batch", ctx)
 }

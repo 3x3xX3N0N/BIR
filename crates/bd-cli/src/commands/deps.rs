@@ -6,7 +6,8 @@ use anyhow::Result;
 use bd_core::Dependency;
 use serde_json::json;
 
-use crate::cli::DepCmd;
+use crate::cli::{DepCmd, GraphCmd};
+use crate::commands::stub;
 use crate::context::Ctx;
 
 pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
@@ -43,8 +44,8 @@ pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
         DepCmd::List { id } => list(ctx, &id).await,
         DepCmd::Tree { id, depth } => tree(ctx, &id, depth).await,
         DepCmd::Cycles => cycles(ctx).await,
-        DepCmd::Relate { .. } => crate::commands::stub("dep relate", ctx),
-        DepCmd::Unrelate { .. } => crate::commands::stub("dep unrelate", ctx),
+        DepCmd::Relate { .. } => stub("dep relate", ctx),
+        DepCmd::Unrelate { .. } => stub("dep unrelate", ctx),
     }
 }
 
@@ -205,4 +206,22 @@ pub async fn recompute_blocked(ctx: &Ctx) -> Result<()> {
             .line(format!("Recomputed blocked state; {n} issue(s) changed."));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registered, not ported
+// ---------------------------------------------------------------------------
+
+/// Bare `bd graph` renders the graph; `bd graph check` audits it. Two different
+/// commands wearing one name, which is why the subcommand is optional.
+pub async fn graph(ctx: &Ctx, cmd: Option<GraphCmd>) -> Result<()> {
+    let name = match cmd {
+        Some(GraphCmd::Check) => "graph check",
+        None => "graph",
+    };
+    stub(name, ctx)
+}
+
+pub async fn flatten(ctx: &Ctx, _id: &str) -> Result<()> {
+    stub("flatten", ctx)
 }

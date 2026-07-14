@@ -228,7 +228,12 @@ pub enum Commands {
     /// Set an issue's priority
     Priority { id: String, priority: Priority },
     /// Add or remove tags
-    Tag { id: String, tags: Vec<String> },
+    /// Prefix a tag with `-` to remove it: `bd tag x-1 urgent -stale`
+    Tag {
+        id: String,
+        #[arg(required = true, allow_hyphen_values = true)]
+        tags: Vec<String>,
+    },
     /// Labels on issues
     Label {
         #[command(subcommand)]
@@ -246,7 +251,11 @@ pub enum Commands {
         cmd: CommentsCmd,
     },
     /// Append to an issue's notes
-    Note { id: String, text: Vec<String> },
+    Note {
+        id: String,
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
     /// Hide an issue from `bd ready` until later
     Defer {
         id: String,
@@ -556,13 +565,19 @@ pub enum Commands {
         cmd: HumanCmd,
     },
     /// Remember something
-    Remember { text: Vec<String> },
+    Remember {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
     /// List memories
     Memories,
     /// Forget a memory
     Forget { id: String },
     /// Search memories
-    Recall { text: Vec<String> },
+    Recall {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
 }
 
 impl Commands {
@@ -867,9 +882,17 @@ pub struct DepAddArgs {
 #[derive(Subcommand, Debug)]
 pub enum LabelCmd {
     /// Add labels to an issue
-    Add { id: String, labels: Vec<String> },
+    Add {
+        id: String,
+        #[arg(required = true)]
+        labels: Vec<String>,
+    },
     /// Remove labels from an issue
-    Remove { id: String, labels: Vec<String> },
+    Remove {
+        id: String,
+        #[arg(required = true)]
+        labels: Vec<String>,
+    },
     /// Labels on one issue
     List { id: String },
     /// Every label in the workspace
