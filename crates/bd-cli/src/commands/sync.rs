@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use anyhow::{Context as _, Result};
 use bd_core::{Dependency, Issue, IssueFilter, Status};
-use bd_storage::IssuePatch;
+use bd_storage::{Field, IssuePatch};
 use serde_json::{Value, json};
 
 use crate::cli::{DoltCmd, DoltRemoteCmd, ExportArgs, ImportArgs, TrackerCmd, VcCmd};
@@ -18,7 +18,7 @@ use crate::output::export_record;
 // ---------------------------------------------------------------------------
 
 pub async fn export(ctx: &Ctx, a: ExportArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let mut f = IssueFilter::new();
     if a.open_only {
@@ -61,7 +61,7 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
     if !a.dry_run {
         ctx.ensure_writable("import")?;
     }
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let reader: Box<dyn BufRead> = match a.file.as_deref() {
         Some(p) if p != std::path::Path::new("-") => Box::new(BufReader::new(
@@ -172,24 +172,30 @@ pub async fn import(ctx: &Ctx, a: ImportArgs) -> Result<()> {
 }
 
 /// Everything an imported record can set on an existing issue.
+///
+/// The record is **authoritative**: it carries the issue's whole state, so a
+/// field it does not carry is a field the issue does not have, and gets cleared.
+/// Using the `Option -> Keep` conversion here instead would mean an issue whose
+/// due date was removed upstream keeps its old one forever, because no later
+/// import would ever say "clear it" either.
 fn patch_from(i: &Issue) -> IssuePatch {
     IssuePatch {
         title: Some(i.title.clone()),
-        description: Some(i.description.clone()),
-        design: Some(i.design.clone()),
-        acceptance_criteria: Some(i.acceptance_criteria.clone()),
-        notes: Some(i.notes.clone()),
+        description: Field::Set(i.description.clone()),
+        design: Field::Set(i.design.clone()),
+        acceptance_criteria: Field::Set(i.acceptance_criteria.clone()),
+        notes: Field::Set(i.notes.clone()),
         status: Some(i.status.clone()),
         priority: Some(i.priority),
         issue_type: Some(i.issue_type.clone()),
-        assignee: Some(i.assignee.clone()),
-        estimated_minutes: i.estimated_minutes,
-        due_at: i.due_at,
-        defer_until: i.defer_until,
-        close_reason: (!i.close_reason.is_empty()).then(|| i.close_reason.clone()),
-        metadata: i.metadata.clone(),
-        spec_id: (!i.spec_id.is_empty()).then(|| i.spec_id.clone()),
-        external_ref: i.external_ref.clone(),
+        assignee: Field::Set(i.assignee.clone()),
+        estimated_minutes: Field::authoritative(i.estimated_minutes),
+        due_at: Field::authoritative(i.due_at),
+        defer_until: Field::authoritative(i.defer_until),
+        close_reason: Field::Set(i.close_reason.clone()),
+        metadata: Field::authoritative(i.metadata.clone()),
+        spec_id: Field::Set(i.spec_id.clone()),
+        external_ref: Field::authoritative(i.external_ref.clone()),
         pinned: Some(i.pinned),
     }
 }

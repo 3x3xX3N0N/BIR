@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use bd_core::{Comment, Dependency, Event, EventType, Issue, IssueFilter, Status, idgen};
-use bd_storage::{Backend, Claim, Error, Identity, IssuePatch, Result, Stats, Storage};
+use bd_storage::{Backend, Claim, Error, Field, Identity, IssuePatch, Result, Stats, Storage};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use std::collections::{HashMap, HashSet};
@@ -115,18 +115,10 @@ impl Storage for SqliteStore {
             if let Some(v) = &patch.title {
                 qb.push(", title = ").push_bind(v.clone());
             }
-            if let Some(v) = &patch.description {
-                qb.push(", description = ").push_bind(v.clone());
-            }
-            if let Some(v) = &patch.design {
-                qb.push(", design = ").push_bind(v.clone());
-            }
-            if let Some(v) = &patch.acceptance_criteria {
-                qb.push(", acceptance_criteria = ").push_bind(v.clone());
-            }
-            if let Some(v) = &patch.notes {
-                qb.push(", notes = ").push_bind(v.clone());
-            }
+            push_text(&mut qb, "description", &patch.description);
+            push_text(&mut qb, "design", &patch.design);
+            push_text(&mut qb, "acceptance_criteria", &patch.acceptance_criteria);
+            push_text(&mut qb, "notes", &patch.notes);
             if let Some(v) = &patch.status {
                 qb.push(", status = ").push_bind(v.as_str().to_string());
                 if v.is_closed() && !old.status.is_closed() {
@@ -143,32 +135,80 @@ impl Storage for SqliteStore {
             if let Some(v) = &patch.issue_type {
                 qb.push(", issue_type = ").push_bind(v.as_str().to_string());
             }
-            if let Some(v) = &patch.assignee {
-                qb.push(", assignee = ").push_bind(v.clone());
+            // Clearing the assignee is what `bd unclaim` does, and it must drop
+            // the lease with it -- an unassigned issue still holding a lease is
+            // invisible to `bd ready` and claimable by nobody.
+            match &patch.assignee {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", assignee = ").push_bind(v.clone());
+                }
+                Field::Clear => {
+                    qb.push(", assignee = '', lease_expires_at = NULL, heartbeat_at = NULL");
+                }
             }
-            if let Some(v) = patch.estimated_minutes {
-                qb.push(", estimated_minutes = ").push_bind(v);
+            push_text(&mut qb, "spec_id", &patch.spec_id);
+
+            match patch.estimated_minutes {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", estimated_minutes = ").push_bind(v);
+                }
+                Field::Clear => {
+                    qb.push(", estimated_minutes = NULL");
+                }
             }
-            if let Some(v) = patch.due_at {
-                qb.push(", due_at = ").push_bind(v);
+            match patch.due_at {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", due_at = ").push_bind(v);
+                }
+                Field::Clear => {
+                    qb.push(", due_at = NULL");
+                }
             }
-            if let Some(v) = patch.defer_until {
-                qb.push(", defer_until = ").push_bind(v);
+            // `bd undefer`: a NULL defer_until is what puts the issue back in
+            // `bd ready`, so this clear is load-bearing, not cosmetic.
+            match patch.defer_until {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", defer_until = ").push_bind(v);
+                }
+                Field::Clear => {
+                    qb.push(", defer_until = NULL");
+                }
             }
-            if let Some(v) = &patch.close_reason {
-                // Derived column and its source move together, always.
-                qb.push(", close_reason = ").push_bind(v.clone());
-                qb.push(", close_is_failure = ")
-                    .push_bind(bd_core::types::is_failure_close(v));
+            // The derived column and its source move together, always: a
+            // close_reason whose close_is_failure disagrees with it silently
+            // changes which conditional-blocks edges release.
+            match &patch.close_reason {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", close_reason = ").push_bind(v.clone());
+                    qb.push(", close_is_failure = ")
+                        .push_bind(bd_core::types::is_failure_close(v));
+                }
+                Field::Clear => {
+                    qb.push(", close_reason = '', close_is_failure = 0");
+                }
             }
-            if let Some(v) = &patch.metadata {
-                qb.push(", metadata = ").push_bind(v.to_string());
+            match &patch.metadata {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", metadata = ").push_bind(v.to_string());
+                }
+                Field::Clear => {
+                    qb.push(", metadata = NULL");
+                }
             }
-            if let Some(v) = &patch.spec_id {
-                qb.push(", spec_id = ").push_bind(v.clone());
-            }
-            if let Some(v) = &patch.external_ref {
-                qb.push(", external_ref = ").push_bind(v.clone());
+            match &patch.external_ref {
+                Field::Keep => {}
+                Field::Set(v) => {
+                    qb.push(", external_ref = ").push_bind(v.clone());
+                }
+                Field::Clear => {
+                    qb.push(", external_ref = NULL");
+                }
             }
             if let Some(v) = patch.pinned {
                 qb.push(", pinned = ").push_bind(v);
@@ -740,6 +780,87 @@ impl Storage for SqliteStore {
 
     // -- comments and audit trail --------------------------------------------
 
+    /// Labels for many issues in one round trip.
+    ///
+    /// An empty `ids` returns empty rather than building `IN ()`, which is not
+    /// legal SQL. Issues with no labels are simply absent from the result, so a
+    /// caller should treat "missing" as "none" rather than expecting a row back
+    /// for every id it asked about.
+    async fn labels_of(&self, ids: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT issue_id, label FROM labels WHERE issue_id IN (");
+        let mut sep = qb.separated(", ");
+        for id in ids {
+            sep.push_bind(id.clone());
+        }
+        qb.push(") ORDER BY issue_id, label");
+
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(db)?;
+
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let issue_id: String = row.try_get("issue_id").map_err(db)?;
+            let label: String = row.try_get("label").map_err(db)?;
+            grouped.entry(issue_id).or_default().push(label);
+        }
+
+        // Return in the caller's order so a listing can zip this against its
+        // rows without re-sorting.
+        Ok(ids
+            .iter()
+            .filter_map(|id| grouped.remove(id).map(|labels| (id.clone(), labels)))
+            .collect())
+    }
+
+    /// Insert or update a comment, preserving its id and author.
+    ///
+    /// This is the idempotent half of the pair. `add_comment` mints a new id and
+    /// stamps the caller as author; re-running an import through it would
+    /// duplicate every comment and reattribute all of them to the importer.
+    async fn upsert_comment(&self, comment: &Comment) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+
+        if fetch_issue(&mut tx, &comment.issue_id).await?.is_none() {
+            return Err(Error::NotFound(comment.issue_id.clone()));
+        }
+
+        // The incoming id is the identity. Comment ids are integers here, so a
+        // non-numeric id from a foreign exporter cannot be honored -- and
+        // silently minting a new one would defeat the idempotency this method
+        // exists to provide, so it is an error rather than a surprise.
+        let id: i64 = comment.id.parse().map_err(|_| {
+            Error::Db(format!(
+                "comment id {:?} is not an integer; cannot upsert it without inventing a new id",
+                comment.id
+            ))
+        })?;
+
+        sqlx::query(
+            "INSERT INTO comments (id, issue_id, author, text, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 issue_id   = excluded.issue_id,
+                 author     = excluded.author,
+                 text       = excluded.text,
+                 created_at = excluded.created_at",
+        )
+        .bind(id)
+        .bind(&comment.issue_id)
+        .bind(&comment.author)
+        .bind(&comment.text)
+        .bind(comment.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+
     async fn add_comment(&self, issue_id: &str, text: &str) -> Result<Comment> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let now = Utc::now();
@@ -1051,6 +1172,25 @@ async fn insert_issue(conn: &mut SqliteConnection, i: &Issue) -> Result<()> {
             Err(Error::AlreadyExists(i.id.clone()))
         }
         Err(e) => Err(db(e)),
+    }
+}
+
+/// Push a `SET col = …` clause for a text column whose domain type is `String`.
+///
+/// Clearing one of these means the empty string, not NULL: `Issue.notes` is a
+/// `String`, so a NULL would only be read back as `""` anyway, and storing one
+/// would just give the same value two spellings for a reader to trip over.
+///
+/// `col` is always a literal from this module, never user input.
+fn push_text(qb: &mut QueryBuilder<'_, Sqlite>, col: &str, field: &Field<String>) {
+    match field {
+        Field::Keep => {}
+        Field::Set(v) => {
+            qb.push(format!(", {col} = ")).push_bind(v.clone());
+        }
+        Field::Clear => {
+            qb.push(format!(", {col} = ''"));
+        }
     }
 }
 

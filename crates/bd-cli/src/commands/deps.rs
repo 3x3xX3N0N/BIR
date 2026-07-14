@@ -13,7 +13,7 @@ pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
     match cmd {
         DepCmd::Add(a) => {
             ctx.ensure_writable("add a dependency")?;
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             let mut d = Dependency::new(&a.issue, &a.depends_on, a.dep_type.clone())?;
             d.created_by = ctx.identity.actor.clone();
             store.add_dependency(&d).await?;
@@ -29,7 +29,7 @@ pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
         }
         DepCmd::Remove { issue, depends_on } => {
             ctx.ensure_writable("remove a dependency")?;
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             store.remove_dependency(&issue, &depends_on).await?;
             if ctx.out.is_json() {
                 ctx.out
@@ -49,7 +49,7 @@ pub async fn dep(ctx: &Ctx, cmd: DepCmd) -> Result<()> {
 }
 
 async fn list(ctx: &Ctx, id: &str) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let out_edges = store.dependencies_of(id).await?;
     let in_edges = store.dependents_of(id).await?;
 
@@ -95,7 +95,7 @@ struct Frame {
 /// naive recursion would blow the stack on one. Nodes already drawn are marked
 /// and not re-expanded, which also keeps a diamond from doubling the output.
 async fn tree(ctx: &Ctx, root: &str, max_depth: u32) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     if store.get_issue(root).await?.is_none() {
         anyhow::bail!("issue not found: {root}");
     }
@@ -177,7 +177,7 @@ async fn tree(ctx: &Ctx, root: &str, max_depth: u32) -> Result<()> {
 }
 
 async fn cycles(ctx: &Ctx) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let cycles = store.find_cycles().await?;
     if ctx.out.is_json() {
         return ctx.out.json_value(&cycles);
@@ -196,7 +196,7 @@ async fn cycles(ctx: &Ctx) -> Result<()> {
 
 pub async fn recompute_blocked(ctx: &Ctx) -> Result<()> {
     ctx.ensure_writable("recompute blocked state")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let n = store.recompute_blocked().await?;
     if ctx.out.is_json() {
         ctx.out.json_value(&json!({ "updated": n }))?;

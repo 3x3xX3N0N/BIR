@@ -566,11 +566,14 @@ pub enum Commands {
 }
 
 impl Commands {
-    /// What must be resolved before this command runs.
+    /// Whether this command must be standing in a workspace.
     ///
-    /// Stubs get [`Need::Workspace`], not [`Need::Store`]: opening a database
-    /// for a command that will immediately say "not implemented" is a way to
-    /// turn a clean exit 64 into a spurious exit 1.
+    /// There is deliberately no "…and opens the database" case. The store opens
+    /// lazily on first use, so this does not need to know, and — more to the
+    /// point — it does not need *updating* every time a command graduates from
+    /// stub to real. That list existed once; forgetting to add yourself to it
+    /// produced a command that compiled, passed its tests, and then failed at
+    /// runtime claiming there was no workspace.
     pub fn need(&self) -> Need {
         use Commands::*;
         match self {
@@ -578,19 +581,6 @@ impl Commands {
             Init(_) | Version | Completion { .. } | Quickstart | Doctor | Preflight | Onboard
             | Setup | Bootstrap => Need::Nothing,
 
-            // Implemented against the store.
-            Create(_) | Q(_) | Show { .. } | Update(_) | Close(_) | Reopen { .. }
-            | Delete { .. } | Assign { .. } | Unclaim { .. } | Priority { .. } | Comment { .. }
-            | List(_) | Ready(_) | Blocked(_) | Search(_) | Query(_) | Count(_) | Status
-            | History { .. } | RecomputeBlocked | Export(_) | Import(_) => Need::Store,
-
-            Comments { cmd } => cmd.need(),
-            Label { cmd } => cmd.need(),
-            Dep { cmd } => cmd.need(),
-            Config { cmd } => cmd.need(),
-
-            // Everything else: registered, resolved, not yet built. It still
-            // has to be inside a workspace to say anything meaningful.
             _ => Need::Workspace,
         }
     }
@@ -888,15 +878,6 @@ pub enum LabelCmd {
     Propagate { id: String },
 }
 
-impl LabelCmd {
-    fn need(&self) -> Need {
-        match self {
-            LabelCmd::Propagate { .. } => Need::Workspace,
-            _ => Need::Store,
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 pub enum CommentsCmd {
     /// An issue's comments
@@ -907,12 +888,6 @@ pub enum CommentsCmd {
         #[arg(required = true)]
         text: Vec<String>,
     },
-}
-
-impl CommentsCmd {
-    fn need(&self) -> Need {
-        Need::Store
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -936,15 +911,6 @@ pub enum DepCmd {
     Relate { from: String, to: String },
     /// Remove a relation
     Unrelate { from: String, to: String },
-}
-
-impl DepCmd {
-    fn need(&self) -> Need {
-        match self {
-            DepCmd::Relate { .. } | DepCmd::Unrelate { .. } => Need::Workspace,
-            _ => Need::Store,
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1072,15 +1038,6 @@ pub enum ConfigCmd {
     Validate,
     /// Show the effective configuration, with its sources
     Show,
-}
-
-impl ConfigCmd {
-    fn need(&self) -> Need {
-        match self {
-            ConfigCmd::Set { .. } | ConfigCmd::Get { .. } | ConfigCmd::List => Need::Store,
-            _ => Need::Workspace,
-        }
-    }
 }
 
 #[derive(Subcommand, Debug)]

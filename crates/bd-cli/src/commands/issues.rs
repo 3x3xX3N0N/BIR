@@ -2,7 +2,8 @@
 
 use anyhow::{Result, bail};
 use bd_core::{Dependency, Issue, IssueType, Priority};
-use bd_storage::IssuePatch;
+use bd_storage::{Field, IssuePatch};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::cli::{CloseArgs, CommentsCmd, CreateArgs, LabelCmd, QuickArgs, UpdateArgs};
@@ -11,7 +12,7 @@ use crate::output::issue_json;
 
 pub async fn create(ctx: &Ctx, a: CreateArgs) -> Result<()> {
     ctx.ensure_writable("create an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let description = a.description.unwrap_or_default();
     let prefix = ctx.prefix().await;
@@ -69,7 +70,7 @@ pub async fn create(ctx: &Ctx, a: CreateArgs) -> Result<()> {
 /// `ISSUE=$(bd q "...")` works without any parsing.
 pub async fn quick(ctx: &Ctx, a: QuickArgs) -> Result<()> {
     ctx.ensure_writable("create an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let prefix = ctx.prefix().await;
     let id = store.next_id(&prefix, &a.title, "").await?;
@@ -103,7 +104,7 @@ pub async fn quick(ctx: &Ctx, a: QuickArgs) -> Result<()> {
 }
 
 pub async fn show(ctx: &Ctx, ids: &[String]) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut docs = Vec::new();
 
     for (n, id) in ids.iter().enumerate() {
@@ -139,27 +140,31 @@ pub async fn show(ctx: &Ctx, ids: &[String]) -> Result<()> {
 
 pub async fn update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     ctx.ensure_writable("update an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
+    // An absent flag becomes `Field::Keep`, never `Field::Clear` -- so omitting
+    // `--assignee` leaves the assignee alone rather than silently unassigning.
+    // Clearing is only ever reachable by asking for it: `bd unclaim`,
+    // `bd undefer`.
     let mut patch = IssuePatch {
         title: a.title,
-        description: a.description,
-        design: a.design,
-        acceptance_criteria: a.acceptance,
-        notes: a.notes,
+        description: a.description.into(),
+        design: a.design.into(),
+        acceptance_criteria: a.acceptance.into(),
+        notes: a.notes.into(),
         status: a.status,
         priority: a.priority,
         issue_type: a.issue_type,
-        assignee: a.assignee,
-        estimated_minutes: a.estimate,
-        due_at: a.due,
-        defer_until: a.defer_until,
-        spec_id: a.spec_id,
-        external_ref: a.external_ref,
+        assignee: a.assignee.into(),
+        estimated_minutes: a.estimate.into(),
+        due_at: a.due.into(),
+        defer_until: a.defer_until.into(),
+        spec_id: a.spec_id.into(),
+        external_ref: a.external_ref.into(),
         ..Default::default()
     };
     if let Some(m) = &a.metadata {
-        patch.metadata = Some(
+        patch.metadata = Field::Set(
             serde_json::from_str(m).map_err(|e| anyhow::anyhow!("--metadata is not JSON: {e}"))?,
         );
     }
@@ -204,7 +209,7 @@ pub async fn update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
 
 pub async fn close(ctx: &Ctx, a: CloseArgs) -> Result<()> {
     ctx.ensure_writable("close an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let mut closed = Vec::new();
     for id in &a.ids {
@@ -222,7 +227,7 @@ pub async fn close(ctx: &Ctx, a: CloseArgs) -> Result<()> {
 
 pub async fn reopen(ctx: &Ctx, ids: &[String]) -> Result<()> {
     ctx.ensure_writable("reopen an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     let mut reopened = Vec::new();
     for id in ids {
@@ -238,7 +243,7 @@ pub async fn reopen(ctx: &Ctx, ids: &[String]) -> Result<()> {
 
 pub async fn delete(ctx: &Ctx, ids: &[String]) -> Result<()> {
     ctx.ensure_writable("delete an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
 
     for id in ids {
         store.delete_issue(id).await?;
@@ -250,11 +255,59 @@ pub async fn delete(ctx: &Ctx, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Hide an issue from `bd ready` until a time passes.
+///
+/// Deferring does not block the issue — nothing is waiting on it and the graph
+/// is untouched. It is simply not yet due, so `bd ready` skips it and picks it
+/// back up on its own once the clock catches up.
+pub async fn defer(ctx: &Ctx, id: &str, until: Option<DateTime<Utc>>) -> Result<()> {
+    ctx.ensure_writable("defer an issue")?;
+    let store = ctx.store().await?;
+
+    // No `--until` means "not now, ask me later": deferring indefinitely would
+    // be a quiet way to lose work, so default to a day rather than to forever.
+    let until = until.unwrap_or_else(|| Utc::now() + chrono::Duration::days(1));
+
+    let patch = IssuePatch {
+        defer_until: Field::Set(until),
+        ..Default::default()
+    };
+    let issue = store.update_issue(id, &patch).await?;
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&issue_json(&issue, &[], &[], &[]))?;
+    } else {
+        ctx.out
+            .line(format!("Deferred {id} until {}", until.format("%Y-%m-%d %H:%M")));
+    }
+    Ok(())
+}
+
+/// Bring a deferred issue back into `bd ready` now.
+pub async fn undefer(ctx: &Ctx, id: &str) -> Result<()> {
+    ctx.ensure_writable("undefer an issue")?;
+    let store = ctx.store().await?;
+
+    // `Field::Clear`, not `Field::Set(now)`. Setting the deadline to the present
+    // would *look* right -- the issue reappears in `bd ready` either way -- but
+    // it leaves a defer_until behind, so the issue reads as "deferred, and the
+    // deadline happened to pass" rather than "not deferred". The distinction
+    // surfaces the moment anything asks which issues are deferred.
+    let issue = store.update_issue(id, &IssuePatch::undefer()).await?;
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&issue_json(&issue, &[], &[], &[]))?;
+    } else {
+        ctx.out.line(format!("Undeferred {id}; it is claimable again"));
+    }
+    Ok(())
+}
+
 pub async fn assign(ctx: &Ctx, id: &str, assignee: &str) -> Result<()> {
     ctx.ensure_writable("assign an issue")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let patch = IssuePatch {
-        assignee: Some(assignee.to_string()),
+        assignee: Field::Set(assignee.to_string()),
         ..Default::default()
     };
     let issue = store.update_issue(id, &patch).await?;
@@ -268,7 +321,7 @@ pub async fn assign(ctx: &Ctx, id: &str, assignee: &str) -> Result<()> {
 
 pub async fn unclaim(ctx: &Ctx, id: &str) -> Result<()> {
     ctx.ensure_writable("release a claim")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     store.release_claim(id).await?;
     if ctx.out.is_json() {
         ctx.out.json_value(&json!({ "id": id, "claim": null }))?;
@@ -280,7 +333,7 @@ pub async fn unclaim(ctx: &Ctx, id: &str) -> Result<()> {
 
 pub async fn priority(ctx: &Ctx, id: &str, priority: Priority) -> Result<()> {
     ctx.ensure_writable("change a priority")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let patch = IssuePatch {
         priority: Some(priority),
         ..Default::default()
@@ -296,7 +349,7 @@ pub async fn priority(ctx: &Ctx, id: &str, priority: Priority) -> Result<()> {
 
 pub async fn comment(ctx: &Ctx, id: &str, text: &str) -> Result<()> {
     ctx.ensure_writable("comment")?;
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let c = store.add_comment(id, text).await?;
     if ctx.out.is_json() {
         ctx.out.json_value(&c)?;
@@ -309,7 +362,7 @@ pub async fn comment(ctx: &Ctx, id: &str, text: &str) -> Result<()> {
 pub async fn comments(ctx: &Ctx, cmd: CommentsCmd) -> Result<()> {
     match cmd {
         CommentsCmd::List { id } => {
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             let cs = store.list_comments(&id).await?;
             ctx.out.comments(&cs)
         }
@@ -321,7 +374,7 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
     match cmd {
         LabelCmd::Add { id, labels } => {
             ctx.ensure_writable("add a label")?;
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             if labels.is_empty() {
                 bail!("no labels given");
             }
@@ -338,7 +391,7 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
         }
         LabelCmd::Remove { id, labels } => {
             ctx.ensure_writable("remove a label")?;
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             if labels.is_empty() {
                 bail!("no labels given");
             }
@@ -354,7 +407,7 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
             Ok(())
         }
         LabelCmd::List { id } => {
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             // There is no per-issue label getter on the seam: an issue's labels
             // are hydrated onto the issue itself.
             let issue = store
@@ -373,7 +426,7 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
             Ok(())
         }
         LabelCmd::ListAll => {
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             let labels = store.list_labels().await?;
             if ctx.out.is_json() {
                 ctx.out.json_value(&labels)?;

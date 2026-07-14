@@ -39,6 +39,42 @@ pub use error::{Error, Result};
 pub use locator::{Backend, Locator};
 pub use stats::Stats;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_can_say_leave_it_set_it_and_empty_it() {
+        // The distinction Option<T> could not make, and the reason `bd undefer`
+        // and `bd unassign` were unwritable.
+        let current = Some("alice".to_string());
+        assert_eq!(Field::Keep.resolve(current.clone()), Some("alice".into()));
+        assert_eq!(
+            Field::Set("bob".to_string()).resolve(current.clone()),
+            Some("bob".into())
+        );
+        assert_eq!(Field::<String>::Clear.resolve(current), None);
+    }
+
+    #[test]
+    fn a_missing_flag_keeps_rather_than_clears() {
+        // The whole point: an absent CLI flag must never silently empty a field.
+        let from_absent_flag: Field<String> = None.into();
+        assert_eq!(from_absent_flag, Field::Keep);
+        let from_present_flag: Field<String> = Some("x".to_string()).into();
+        assert_eq!(from_present_flag, Field::Set("x".into()));
+    }
+
+    #[test]
+    fn undefer_clears_only_defer_until() {
+        let p = IssuePatch::undefer();
+        assert_eq!(p.defer_until, Field::Clear);
+        assert!(p.assignee.is_keep());
+        assert!(p.title.is_none());
+        assert!(!p.is_empty());
+    }
+}
+
 /// Who is performing an operation. Set once, when the store is opened.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Identity {
@@ -70,32 +106,136 @@ pub struct Claim {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Fields to change on an issue. `None` means "leave alone", which is what
-/// makes a partial update expressible without a read-modify-write race.
+/// One field of a patch: leave it, set it, or empty it.
+///
+/// `Option<T>` cannot express this. In a patch, `None` already means "leave this
+/// alone" — which uses up the only empty case and leaves no way to say "set this
+/// back to nothing". That gap is not academic: it is exactly why `bd undefer`
+/// and `bd unassign` could not be written. Clearing a field is a real operation
+/// and it needs a real representation.
+///
+/// `Option<Option<T>>` would technically work and would be unreadable at every
+/// call site.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Field<T> {
+    /// Not mentioned in this patch.
+    #[default]
+    Keep,
+    Set(T),
+    /// Explicitly emptied — to SQL NULL, or to the type's empty value.
+    Clear,
+}
+
+impl<T> Field<T> {
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Field::Keep)
+    }
+
+    pub fn as_set(&self) -> Option<&T> {
+        match self {
+            Field::Set(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Apply this patch field to whatever is currently stored.
+    pub fn resolve(self, current: Option<T>) -> Option<T> {
+        match self {
+            Field::Keep => current,
+            Field::Set(v) => Some(v),
+            Field::Clear => None,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Field<U> {
+        match self {
+            Field::Keep => Field::Keep,
+            Field::Set(v) => Field::Set(f(v)),
+            Field::Clear => Field::Clear,
+        }
+    }
+
+    /// Build from a source that is *authoritative* about the whole issue — an
+    /// import record, a sync from an upstream tracker.
+    ///
+    /// Here `None` means "this issue has no estimate", so the field is
+    /// **cleared**. That is the exact opposite of [`Field::from`]`(Option<T>)`,
+    /// where `None` came from an unmentioned CLI flag and must be *kept*.
+    ///
+    /// The two look identical at the call site and mean opposite things, which
+    /// is precisely why this one has a name. Import an issue whose estimate was
+    /// removed upstream through the wrong one and the stale estimate survives
+    /// forever, because nothing will ever say "clear it" again.
+    pub fn authoritative(o: Option<T>) -> Self {
+        match o {
+            Some(v) => Field::Set(v),
+            None => Field::Clear,
+        }
+    }
+}
+
+/// `Some(v)` sets, `None` keeps — so a plain CLI flag converts without ceremony.
+/// Clearing is never accidental; it has to be asked for by name.
+impl<T> From<Option<T>> for Field<T> {
+    fn from(o: Option<T>) -> Self {
+        match o {
+            Some(v) => Field::Set(v),
+            None => Field::Keep,
+        }
+    }
+}
+
+/// Fields to change on an issue.
+///
+/// Nullable fields use [`Field`] so they can be cleared. The rest stay
+/// `Option<T>` on purpose: an issue always has a title, a status, a priority and
+/// a type, so "clear the status" is not a thing anyone should be able to say.
+/// The type refuses to represent it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IssuePatch {
+    // Always present; `None` means "leave alone" and clearing is meaningless.
     pub title: Option<String>,
-    pub description: Option<String>,
-    pub design: Option<String>,
-    pub acceptance_criteria: Option<String>,
-    pub notes: Option<String>,
     pub status: Option<bd_core::Status>,
     pub priority: Option<bd_core::Priority>,
     pub issue_type: Option<bd_core::IssueType>,
-    pub assignee: Option<String>,
-    pub estimated_minutes: Option<i32>,
-    pub due_at: Option<DateTime<Utc>>,
-    pub defer_until: Option<DateTime<Utc>>,
-    pub close_reason: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub spec_id: Option<String>,
-    pub external_ref: Option<String>,
     pub pinned: Option<bool>,
+
+    // Free text: empty is a legitimate value, so these are clearable.
+    pub description: Field<String>,
+    pub design: Field<String>,
+    pub acceptance_criteria: Field<String>,
+    pub notes: Field<String>,
+    pub close_reason: Field<String>,
+
+    // Nullable columns.
+    pub assignee: Field<String>,
+    pub estimated_minutes: Field<i32>,
+    pub due_at: Field<DateTime<Utc>>,
+    pub defer_until: Field<DateTime<Utc>>,
+    pub metadata: Field<serde_json::Value>,
+    pub spec_id: Field<String>,
+    pub external_ref: Field<String>,
 }
 
 impl IssuePatch {
     pub fn is_empty(&self) -> bool {
         *self == IssuePatch::default()
+    }
+
+    /// `bd unclaim`: drop the assignee and let the lease go.
+    pub fn unassign() -> Self {
+        IssuePatch {
+            assignee: Field::Clear,
+            ..Default::default()
+        }
+    }
+
+    /// `bd undefer`: bring an issue back into `bd ready` now.
+    pub fn undefer() -> Self {
+        IssuePatch {
+            defer_until: Field::Clear,
+            ..Default::default()
+        }
     }
 }
 
@@ -159,11 +299,30 @@ pub trait Storage: Send + Sync {
 
     async fn add_label(&self, issue_id: &str, label: &str) -> Result<()>;
     async fn remove_label(&self, issue_id: &str, label: &str) -> Result<()>;
+    /// Every label in the workspace.
     async fn list_labels(&self) -> Result<Vec<String>>;
+
+    /// Labels on each of `ids`, in one query.
+    ///
+    /// Batched deliberately. `list_issues` does not hydrate relations, so
+    /// without this the only way to label a listing was to re-read every issue
+    /// one at a time — which is how `bd export` silently dropped labels before
+    /// anyone noticed, and how it would have become an N+1 once it didn't.
+    async fn labels_of(&self, ids: &[String]) -> Result<Vec<(String, Vec<String>)>>;
 
     // --- comments and audit trail ---
 
     async fn add_comment(&self, issue_id: &str, text: &str) -> Result<bd_core::Comment>;
+
+    /// Insert a comment, or update it if `id` already exists.
+    ///
+    /// This is what `bd import` needs and `add_comment` cannot give it:
+    /// `add_comment` mints a fresh id and stamps the *importer* as the author,
+    /// so re-importing the same file duplicates every comment and misattributes
+    /// all of them. An upsert keyed on the incoming id makes import idempotent
+    /// and keeps the original author.
+    async fn upsert_comment(&self, comment: &bd_core::Comment) -> Result<()>;
+
     async fn list_comments(&self, issue_id: &str) -> Result<Vec<bd_core::Comment>>;
     async fn list_events(&self, issue_id: &str) -> Result<Vec<Event>>;
 

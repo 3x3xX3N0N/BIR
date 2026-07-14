@@ -15,25 +15,32 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use bd_storage::{Backend, Identity, Locator, Storage};
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 
 use crate::cli::Cli;
 use crate::output::Out;
 use crate::parse;
 
-/// How much of the world a command needs before it runs.
+/// Whether a command must be standing in a workspace at all.
 ///
-/// The interesting value is [`Need::Workspace`]: it means "resolve the
-/// workspace but do not open the database". Stubs and capability probes want
-/// this — opening a store for a command that will do nothing is pure downside,
-/// and it would turn a clean "not implemented yet" into a database error.
+/// Note what is *not* here: any notion of "this command opens the database".
+/// The store opens lazily, on first use, so a command that never asks for one
+/// never pays for one — and a stub can still exit cleanly with "not implemented"
+/// rather than dying on a database error it had no reason to touch.
+///
+/// This used to be a third variant, and it was a trap. It meant a
+/// hand-maintained list of every command that touches the store, so implementing
+/// a command required *also* remembering to reclassify it — and forgetting gave
+/// you a command that compiled, passed its tests, and then failed at runtime
+/// with a bogus "no beads workspace found". Laziness removes the list, and with
+/// it the whole failure mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
     /// Runs before a workspace exists: `init`, `version`, `doctor`, …
     Nothing,
-    /// Must be inside a workspace, but does not touch the database.
+    /// Must be inside a workspace. Whether it opens the database is its own
+    /// business.
     Workspace,
-    /// Must be inside a workspace, with the store open.
-    Store,
 }
 
 pub struct Ctx {
@@ -43,7 +50,8 @@ pub struct Ctx {
     pub config: Config,
     pub out: Out,
     pub readonly: bool,
-    store: Option<Box<dyn Storage>>,
+    /// Opened on first [`Ctx::store`], at most once.
+    store: OnceCell<Box<dyn Storage>>,
 }
 
 impl Ctx {
@@ -94,19 +102,7 @@ impl Ctx {
 
         let out = Out::new(cli.json(), cli.no_color, cli.quiet, cli.verbose);
 
-        // 6. Open the store. The one place outside `init` that names a backend.
-        let store = match (need, &locator) {
-            (Need::Store, Some(l)) => {
-                out.detail(format!(
-                    "opening {} workspace at {}",
-                    l.backend,
-                    l.dir.display()
-                ));
-                Some(open_store(l, identity.clone()).await?)
-            }
-            _ => None,
-        };
-
+        // 6. The store is NOT opened here. See `Ctx::store`.
         Ok(Ctx {
             cwd,
             locator,
@@ -114,20 +110,41 @@ impl Ctx {
             config,
             out,
             readonly: cli.readonly,
-            store,
+            store: OnceCell::new(),
         })
     }
 
-    pub fn store(&self) -> Result<&dyn Storage> {
-        self.store
-            .as_deref()
-            .ok_or_else(|| anyhow!("no beads workspace found (run `bd init`)"))
+    /// The open store, opening it if this is the first ask.
+    ///
+    /// This is the one place outside `init` that names a concrete backend, and
+    /// it reads the backend from the locator — never from a flag or the
+    /// environment (seam rule 3). Everything above gets a `&dyn Storage` and
+    /// never learns what it got.
+    pub async fn store(&self) -> Result<&dyn Storage> {
+        let store = self
+            .store
+            .get_or_try_init(|| async {
+                let l = self
+                    .locator
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no beads workspace found (run `bd init`)"))?;
+                self.out.detail(format!(
+                    "opening {} workspace at {}",
+                    l.backend,
+                    l.dir.display()
+                ));
+                open_store(l, self.identity.clone()).await
+            })
+            .await?;
+        Ok(store.as_ref())
     }
 
-    /// The store if one is open — used by capability probes, which must work
-    /// whether or not the command needed a database.
+    /// The store *if it is already open* — never opens one.
+    ///
+    /// For capability probes, which run on the stub path and must not drag a
+    /// database into existence just to report that a command is unavailable.
     pub fn try_store(&self) -> Option<&dyn Storage> {
-        self.store.as_deref()
+        self.store.get().map(|s| s.as_ref())
     }
 
     pub fn locator(&self) -> Result<&Locator> {
@@ -161,7 +178,7 @@ impl Ctx {
         if let Some(p) = self.config.prefix.clone().filter(|p| !p.is_empty()) {
             return p;
         }
-        if let Ok(store) = self.store() {
+        if let Ok(store) = self.store().await {
             for key in ["issue.prefix", "prefix"] {
                 if let Ok(Some(p)) = store.get_config(key).await
                     && !p.is_empty()
@@ -180,7 +197,8 @@ impl Ctx {
     }
 
     pub async fn close(self) {
-        if let Some(s) = self.store {
+        // Only if something actually opened it. A stub never did.
+        if let Some(s) = self.store.into_inner() {
             let _ = s.close().await;
         }
     }

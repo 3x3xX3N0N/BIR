@@ -125,7 +125,7 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::Set { key, value } => {
             ctx.ensure_writable("set a config key")?;
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             store.set_config(&key, &value).await?;
             if ctx.out.is_json() {
                 ctx.out.json_value(&json!({ "key": key, "value": value }))?;
@@ -135,7 +135,7 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             Ok(())
         }
         ConfigCmd::Get { key } => {
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             let v = store.get_config(&key).await?;
             if ctx.out.is_json() {
                 ctx.out.json_value(&json!({ "key": key, "value": v }))?;
@@ -148,7 +148,7 @@ pub async fn config(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             Ok(())
         }
         ConfigCmd::List => {
-            let store = ctx.store()?;
+            let store = ctx.store().await?;
             let entries = store.list_config().await?;
             if ctx.out.is_json() {
                 let map: serde_json::Map<String, serde_json::Value> = entries

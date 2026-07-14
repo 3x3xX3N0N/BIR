@@ -36,7 +36,7 @@ fn limit(n: u32) -> Option<u32> {
 }
 
 pub async fn list(ctx: &Ctx, a: ListArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut f = IssueFilter::new();
     apply(&mut f, &a.filter);
     if !a.status.is_empty() {
@@ -53,7 +53,7 @@ pub async fn list(ctx: &Ctx, a: ListArgs) -> Result<()> {
 }
 
 pub async fn ready(ctx: &Ctx, a: ReadyArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut f = IssueFilter::ready();
     apply(&mut f, &a.filter);
     f.limit = limit(a.limit);
@@ -64,7 +64,7 @@ pub async fn ready(ctx: &Ctx, a: ReadyArgs) -> Result<()> {
 }
 
 pub async fn blocked(ctx: &Ctx, a: BlockedArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut f = IssueFilter::blocked();
     apply(&mut f, &a.filter);
     f.limit = limit(a.limit);
@@ -74,7 +74,7 @@ pub async fn blocked(ctx: &Ctx, a: BlockedArgs) -> Result<()> {
 }
 
 pub async fn search(ctx: &Ctx, a: SearchArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut f = IssueFilter::new();
     apply(&mut f, &a.filter);
     f.text = Some(a.text.clone());
@@ -88,7 +88,7 @@ pub async fn search(ctx: &Ctx, a: SearchArgs) -> Result<()> {
 }
 
 pub async fn query(ctx: &Ctx, a: QueryArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let q = bd_query::parse(&a.expr)?;
 
     let issues: Vec<Issue> = match q.as_filter() {
@@ -115,7 +115,7 @@ pub async fn query(ctx: &Ctx, a: QueryArgs) -> Result<()> {
 }
 
 pub async fn count(ctx: &Ctx, a: CountArgs) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let mut f = IssueFilter::new();
     apply(&mut f, &a.filter);
     if !a.status.is_empty() {
@@ -134,7 +134,7 @@ pub async fn count(ctx: &Ctx, a: CountArgs) -> Result<()> {
 }
 
 pub async fn status(ctx: &Ctx) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let s = store.stats().await?;
     if ctx.out.is_json() {
         return ctx.out.json_value(&s);
@@ -166,7 +166,7 @@ pub async fn status(ctx: &Ctx) -> Result<()> {
 /// core storage, so this works on every backend. `bd diff` is the one that
 /// needs a commit graph.
 pub async fn history(ctx: &Ctx, id: &str) -> Result<()> {
-    let store = ctx.store()?;
+    let store = ctx.store().await?;
     let events = store.list_events(id).await?;
     ctx.out.events(&events)
 }
