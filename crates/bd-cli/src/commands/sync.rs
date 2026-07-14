@@ -14,6 +14,7 @@ use crate::cli::{
     DoltCmd, DoltRemoteCmd, ExportArgs, FederationCmd, ImportArgs, RepoCmd, TrackerCmd, VcCmd,
 };
 use crate::commands::{Cap, require_cap, stub};
+use crate::integrations;
 use crate::context::Ctx;
 use crate::exit::SilentExit;
 use crate::output::export_record;
@@ -362,14 +363,92 @@ pub async fn mail(ctx: &Ctx, id: Option<String>) -> Result<()> {
 
 /// Every external tracker gets the same four verbs, so they get one handler.
 /// The trackers themselves land in `integrations/`, one file each.
-pub async fn tracker(ctx: &Ctx, tracker: &str, cmd: TrackerCmd) -> Result<()> {
+/// `bd jira sync`, `bd linear pull`, and the rest — one entry point for all six.
+///
+/// The tracker itself comes from the registry, and the HTTP client is injected,
+/// so nothing here (or in any tracker) hard-codes a network call. That is what
+/// makes the integrations testable without credentials.
+pub async fn tracker(ctx: &Ctx, name: &str, cmd: TrackerCmd) -> Result<()> {
     let verb = match cmd {
         TrackerCmd::Sync => "sync",
         TrackerCmd::Status => "status",
         TrackerCmd::Push => "push",
         TrackerCmd::Pull => "pull",
     };
-    stub(&format!("{tracker} {verb}"), ctx)
+
+    let Some(t) = integrations::get(name) else {
+        return stub(&format!("{name} {verb}"), ctx);
+    };
+
+    // `status` is the one verb that must work when the tracker is NOT set up --
+    // it exists precisely to tell you what is missing. Asking for a token first
+    // would make it useless for the only case anyone runs it in.
+    if matches!(cmd, TrackerCmd::Status) {
+        let st = t.status(ctx).await?;
+        if ctx.out.is_json() {
+            ctx.out.json_value(&serde_json::to_value(&st)?)?;
+        } else if st.configured {
+            ctx.out.line(format!("{name}: configured"));
+            if let Some(d) = &st.detail {
+                ctx.out.line(format!("  {d}"));
+            }
+        } else {
+            ctx.out.line(format!("{name}: not configured"));
+            for k in &st.missing {
+                ctx.out.line(format!("  missing: {k}"));
+            }
+            ctx.out
+                .line(format!("  token is read from ${}", t.secret_env()));
+        }
+        return Ok(());
+    }
+
+    // A tracker that is not yet built says so with exit 64, exactly like any
+    // other unported command. It must not look like a configuration problem.
+    let st = t.status(ctx).await?;
+    if st.detail.as_deref() == Some("not implemented yet") {
+        return stub(&format!("{name} {verb}"), ctx);
+    }
+    if !st.configured {
+        bail!(
+            "{name} is not configured (missing: {}). Set them with `bd config set`, \
+             and put the token in ${} — never in .beads/config.yaml, which is committed.",
+            st.missing.join(", "),
+            t.secret_env()
+        );
+    }
+
+    if !matches!(cmd, TrackerCmd::Pull) {
+        ctx.ensure_writable(&format!("{name} {verb}"))?;
+    }
+
+    let http = integrations::http::RealHttp::new()?;
+    let report = match cmd {
+        TrackerCmd::Pull => t.pull(ctx, &http).await?,
+        TrackerCmd::Push => t.push(ctx, &http).await?,
+        TrackerCmd::Sync => t.sync(ctx, &http).await?,
+        TrackerCmd::Status => unreachable!("handled above"),
+    };
+
+    // A pull can land issues and edges that no local write path saw in order, so
+    // the blocked cache is stale by definition until a full recompute. Same
+    // reason `import` does it.
+    if matches!(cmd, TrackerCmd::Pull | TrackerCmd::Sync) {
+        ctx.store().await?.recompute_blocked().await?;
+    }
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&serde_json::to_value(&report)?)?;
+    } else {
+        ctx.out.line(format!(
+            "{name} {verb}: {} pulled ({} created, {} updated), {} pushed",
+            report.pulled, report.created, report.updated, report.pushed
+        ));
+        for s in &report.skipped {
+            ctx.out.warn(format!("skipped: {s}"));
+        }
+    }
+    Ok(())
 }
 
 /// Multi-repo hydration: pull issues from sibling beads workspaces into this

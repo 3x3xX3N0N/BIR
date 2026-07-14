@@ -11,6 +11,7 @@ pub mod cli;
 pub mod commands;
 pub mod context;
 pub mod exit;
+pub mod integrations;
 pub mod output;
 pub mod parse;
 

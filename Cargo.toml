@@ -38,6 +38,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "macros",
 ] }
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
