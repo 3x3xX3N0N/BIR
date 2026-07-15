@@ -13,6 +13,10 @@
 
 pub mod advanced;
 pub mod formula;
+pub mod gate;
+pub mod memory;
+pub mod mol;
+pub mod swarm;
 pub mod deps;
 pub mod issues;
 pub mod maintenance;
@@ -244,21 +248,21 @@ pub async fn dispatch(cmd: Commands, ctx: &Ctx) -> Result<()> {
         C::MergeSlot { cmd } => maintenance::merge_slot(ctx, cmd).await,
 
         // ----- Advanced -----
-        C::Mol { cmd } => advanced::mol(ctx, cmd).await,
+        C::Mol { cmd } => mol::mol(ctx, cmd).await,
         C::Formula { cmd } => advanced::formula(ctx, cmd).await,
         C::Cook {
             formula,
             vars,
             dry_run,
         } => advanced::cook(ctx, formula, vars, dry_run).await,
-        C::Swarm { cmd } => advanced::swarm(ctx, cmd).await,
-        C::Gate { cmd } => advanced::gate(ctx, cmd).await,
-        C::Rules { cmd } => advanced::rules(ctx, cmd).await,
-        C::Todo { cmd } => advanced::todo(ctx, cmd).await,
-        C::Human { cmd } => advanced::human(ctx, cmd).await,
-        C::Remember { text } => advanced::remember(ctx, &text).await,
-        C::Memories => advanced::memories(ctx).await,
-        C::Forget { id } => advanced::forget(ctx, &id).await,
-        C::Recall { text } => advanced::recall(ctx, &text).await,
+        C::Swarm { cmd } => swarm::swarm(ctx, cmd).await,
+        C::Gate { cmd } => gate::gate(ctx, cmd).await,
+        C::Rules { cmd } => swarm::rules(ctx, cmd).await,
+        C::Todo { cmd } => memory::todo(ctx, cmd).await,
+        C::Human { cmd } => memory::human(ctx, cmd).await,
+        C::Remember { text } => memory::remember(ctx, &text).await,
+        C::Memories => memory::memories(ctx).await,
+        C::Forget { id } => memory::forget(ctx, &id).await,
+        C::Recall { text } => memory::recall(ctx, &text).await,
     }
 }
