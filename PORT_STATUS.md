@@ -3,7 +3,7 @@
 The command surface is **complete**: every command upstream has is registered,
 with its flags, aliases and help. What varies is what happens when you run one.
 
-**730 tests. Two backends, both complete and green: SQLite, and Dolt —
+**734 tests. Two backends, both complete and green: SQLite, and Dolt —
 **verified against real dolt 2.1.10** (100 bd-dolt tests run for real; nothing
 skips). Dolt's binary is a runtime dependency, not vendored; install it and it is
 on. See "Dolt: verified" at the bottom.**
@@ -51,7 +51,7 @@ something an install fixes.
 `edit`, `assign`, `unclaim`, `priority`, `defer`/`undefer`, `promote`, `rename`,
 `tag`, `note`, `duplicate`, `supersede`, `link`, `heartbeat`, `batch`,
 `label add|remove|list|list-all`, `comment`, `comments list|add`, `statuses`,
-`types`.
+`types`, `state`, `set-state`, `label propagate`.
 
 **Views** — `list`, `ready`, `blocked`, `search`, `query`, `count`, `status`,
 `history`, `where`, `children`, `epic status|close-eligible`, `info`, `stale`,
@@ -93,7 +93,7 @@ seed`/`pour` cook a formula into a tracked container.
 | `mol distill` | Needs `--var` and an `--output` path (flagless `Distill { id }` cannot supply them) to emit a *parameterized* `.formula.toml`. A literal, un-reusable formula is the one thing distill exists not to produce. |
 | `swarm create` / `swarm status` | Ride on a `mol_type = swarm` molecule linked to an epic, and a `convoy`-type formula that `bd-formula` does not cook yet. No honest substrate. |
 | `rules compact` | It merges rule files and *deletes the sources*. The flagless `Compact` variant offers no `--dry-run`/`--group`/`--auto`, so it cannot be driven safely — refusing beats a reckless default. |
-| `restore`, `state`, `set-state`, `label propagate` | Custom-status workflow; the seam has the pieces. |
+| `restore` | Needs a *soft* delete; this port's `delete` is a hard cascade, so there is nothing to restore. |
 | `flatten` | Graph flattening; unbuilt. |
 | `compact`, `migrate`, `rename-prefix`, `admin compact`, `admin reset` | `migrate` wants `Storage::schema_version()`, which this port has no notion of. Deliberately **not** exit 2: SQLite compacts (`VACUUM`) and SQLite has a schema, so "the backend cannot" would be a lie. |
 | `config unset` / `validate` / `show` | The seam has no config *delete*. |
