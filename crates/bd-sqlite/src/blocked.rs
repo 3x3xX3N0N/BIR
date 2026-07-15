@@ -174,33 +174,79 @@ fn unmark_sql(where_ids: &str) -> String {
 /// reason: rows that arrived without going through `close_issue` never had it
 /// computed.
 ///
-/// Returns the number of rows whose `is_blocked` changed.
+/// Returns the number of rows whose `is_blocked` actually flipped.
+///
+/// # A least fixpoint, and why that matters for cycles
+///
+/// This resets every row to *unblocked* and then only ever marks — it never
+/// unmarks. That is the whole trick. The incremental path ([`recompute_affected`])
+/// repairs toward the truth from the current stored value with both a mark and an
+/// unmark pass, which is right when the graph is already mostly correct and
+/// acyclic. But a full recompute runs after a **merge or import**, which is
+/// exactly when a `parent-child` *cycle* can arrive (write paths reject cycles;
+/// a merge does not go through a write path).
+///
+/// On a cycle the mark+unmark repair does not converge to the truth — it settles
+/// into a *stable but wrong* state: two mutually-parented issues each read the
+/// other's stored `is_blocked = 1` through the parent-child rule, so neither
+/// unmark fires, and the pair stays blocked forever even after the real blocker
+/// closes. mark+unmark returns `Ok` with a lying cache.
+///
+/// Marking from an all-unblocked base cannot do that. A cyclic pair with no open
+/// external blocker starts unmarked, has no direct blocker, and sees an unmarked
+/// parent — so nothing marks it, correctly. A cyclic pair that *does* have an
+/// external blocker gets marked through the direct edge and propagates. And
+/// because marking is monotonic (`0 → 1` only, never back), it always converges,
+/// in at most the graph's depth in `parent-child` edges.
 pub async fn recompute_all(conn: &mut SqliteConnection) -> Result<u64> {
     refresh_close_is_failure(conn).await?;
 
+    // Which rows were blocked before, so we can report only the true flips — the
+    // reset-then-remark below touches rows that end up unchanged, and callers
+    // (e.g. `bd recompute-blocked`, whose test asserts `updated: 0` on an already
+    // correct cache) need the net change, not the churn.
+    let before = blocked_ids(conn).await?;
+
+    // Reset to the all-unblocked base. Only currently-blocked rows are touched,
+    // and — per the note above these functions — `updated_at` is deliberately
+    // never in the SET list, so this does not stamp wall-clock onto a
+    // version-controlled column.
+    sqlx::query("UPDATE issues SET is_blocked = 0 WHERE is_blocked = 1")
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+
     let mark = mark_sql("1 = 1");
-    let unmark = unmark_sql("1 = 1");
-
-    let mut total = 0u64;
+    let mut converged = false;
     for _ in 0..MAX_ITERATIONS {
-        let mut changed = 0u64;
-        changed += sqlx::query(&mark)
+        let changed = sqlx::query(&mark)
             .execute(&mut *conn)
             .await
             .map_err(db)?
             .rows_affected();
-        changed += sqlx::query(&unmark)
-            .execute(&mut *conn)
-            .await
-            .map_err(db)?
-            .rows_affected();
-
-        total += changed;
         if changed == 0 {
-            return Ok(total);
+            converged = true;
+            break;
         }
     }
-    Err(not_converged())
+    // Monotonic marking converges in at most the parent-child depth, so blowing
+    // the cap means a graph deeper than MAX_ITERATIONS levels — vanishingly
+    // unlikely, but a runaway is worth an honest error rather than a wrong cache.
+    if !converged {
+        return Err(not_converged());
+    }
+
+    let after = blocked_ids(conn).await?;
+    Ok(before.symmetric_difference(&after).count() as u64)
+}
+
+/// The ids currently marked blocked. Used only to count true flips.
+async fn blocked_ids(conn: &mut SqliteConnection) -> Result<HashSet<String>> {
+    let rows = sqlx::query("SELECT id FROM issues WHERE is_blocked = 1")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+    rows.iter().map(|r| r.try_get::<String, _>("id").map_err(db)).collect()
 }
 
 /// Recompute `is_blocked` for everything a change to `seed_ids` could possibly
@@ -542,21 +588,52 @@ mod tests {
     }
 
     /// A parent-child cycle cannot be created through `add_dependency`, but a
-    /// merge or an import can land one. The engine must refuse to spin.
+    /// merge or an import can land one — and that is exactly when `recompute_all`
+    /// runs. It must not spin, and — the part the old mark+unmark repair got
+    /// wrong — it must not *lie*.
+    ///
+    /// `bd-a` and `bd-b` are each other's parent (the cycle); `bd-x` blocks
+    /// `bd-a` from outside. While `bd-x` is open the pair is genuinely blocked
+    /// (through it). When `bd-x` closes, the correct answer is that **both are
+    /// free** — a cycle does not block itself. The old repair settled into a
+    /// stable-but-wrong state (each read the other's stored `is_blocked` and
+    /// neither unmarked) and returned `Ok` with both still blocked. The least
+    /// fixpoint marks from an all-unblocked base, so the cycle has no way to
+    /// sustain itself.
     #[tokio::test]
-    async fn a_parent_child_cycle_does_not_spin_forever() {
+    async fn a_parent_child_cycle_is_recomputed_correctly_not_just_without_spinning() {
         let pool = pool().await;
         for id in ["bd-a", "bd-b", "bd-x"] {
             issue(&pool, id).await;
         }
-        // A blocks-depends on X (an open blocker), and A and B are each other's
-        // parent -- so the "blocked" mark has a source and a loop to chase.
         edge(&pool, "bd-a", "bd-x", "blocks").await;
         edge(&pool, "bd-a", "bd-b", "parent-child").await;
         edge(&pool, "bd-b", "bd-a", "parent-child").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        // Either it converges or it says so; what it must not do is loop.
-        let _ = recompute_all(&mut conn).await;
+        recompute_all(&mut conn).await.expect("converges with x open");
+        drop(conn);
+        // x is open, so the cycle really is blocked — through x, not itself.
+        assert!(is_blocked(&pool, "bd-a").await, "a is blocked by x");
+        assert!(is_blocked(&pool, "bd-b").await, "b is blocked via its parent a");
+
+        // Close the only real blocker. The cycle must now read as free.
+        sqlx::query("UPDATE issues SET status = 'closed' WHERE id = 'bd-x'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let changed = recompute_all(&mut conn)
+            .await
+            .expect("still converges after the blocker closes");
+        drop(conn);
+
+        assert!(
+            !is_blocked(&pool, "bd-a").await,
+            "a's only real blocker closed; the cycle must not keep it blocked (this is the bug)"
+        );
+        assert!(!is_blocked(&pool, "bd-b").await, "same for b");
+        assert_eq!(changed, 2, "exactly a and b flipped from blocked to free");
     }
 }
