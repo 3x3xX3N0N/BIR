@@ -352,3 +352,55 @@ fn tempdir(tag: &str) -> PathBuf {
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap()
 }
+
+#[test]
+fn set_state_moves_through_custom_states_and_state_reads_them() {
+    let ws = Ws::new("state");
+    let id = ws.issue("a task");
+
+    // A custom state the port does not hard-code.
+    let doc = ws.json(&["set-state", &id, "reviewing"]);
+    assert_eq!(doc["state"], "reviewing");
+    assert_eq!(ws.json(&["state", &id])["state"], "reviewing");
+
+    // A built-in name resolves to the built-in status, not a custom one.
+    ws.run(&["set-state", &id, "in_progress"]);
+    assert_eq!(ws.json(&["state", &id])["state"], "in_progress");
+
+    // An empty state is a real error.
+    assert_ne!(ws.run(&["set-state", &id, ""]).1, 0);
+    // An unknown issue is a real error, not a silent success.
+    assert_ne!(ws.run(&["state", "t-nope"]).1, 0);
+}
+
+#[test]
+fn label_propagate_copies_a_parents_labels_to_its_children() {
+    let ws = Ws::new("propagate");
+    let epic = ws.issue("the epic");
+    let a = ws.issue("child a");
+    let b = ws.issue("child b");
+    // a and b are children of the epic.
+    ws.run(&["dep", "add", &a, &epic, "--type", "parent-child"]);
+    ws.run(&["dep", "add", &b, &epic, "--type", "parent-child"]);
+    ws.run(&["label", "add", &epic, "area:auth", "release:2"]);
+
+    // Give a one label already, to prove propagate skips duplicates.
+    ws.run(&["label", "add", &a, "area:auth"]);
+
+    let doc = ws.json(&["label", "propagate", &epic]);
+    assert_eq!(doc["children"], 2);
+    // 2 labels x 2 children = 4, minus the 1 a already had = 3.
+    assert_eq!(doc["propagated"], 3);
+
+    // Both children now carry both labels.
+    for kid in [&a, &b] {
+        let labels: Vec<String> =
+            serde_json::from_value(ws.json(&["label", "list", kid])).unwrap();
+        assert!(labels.contains(&"area:auth".to_string()), "{kid}: {labels:?}");
+        assert!(labels.contains(&"release:2".to_string()), "{kid}: {labels:?}");
+    }
+
+    // A parent with no labels propagates nothing, cleanly.
+    let bare = ws.issue("bare epic");
+    assert_eq!(ws.json(&["label", "propagate", &bare])["propagated"], 0);
+}

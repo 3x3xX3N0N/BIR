@@ -448,8 +448,75 @@ pub async fn label(ctx: &Ctx, cmd: LabelCmd) -> Result<()> {
             }
             Ok(())
         }
-        LabelCmd::Propagate { id: _ } => stub("label propagate", ctx),
+        LabelCmd::Propagate { id } => label_propagate(ctx, &id).await,
     }
+}
+
+/// Copy an issue's labels down to its `parent-child` children.
+///
+/// A label on an epic ("area:auth", "release:2.0") usually wants to be on the
+/// work under it, and applying it by hand to every child is exactly the kind of
+/// bookkeeping that rots. This applies the parent's labels to each direct child,
+/// skipping any a child already has, and reports how many it added.
+///
+/// Direct children only, not the whole subtree: propagating recursively is a
+/// different, heavier operation, and a caller who wants it can run this at each
+/// level. A child is the `issue_id` of a `parent-child` edge whose
+/// `depends_on_id` is the parent.
+async fn label_propagate(ctx: &Ctx, id: &str) -> Result<()> {
+    ctx.ensure_writable("propagate labels")?;
+    let store = ctx.store().await?;
+    let parent = require_issue(store, id).await?;
+
+    if parent.labels.is_empty() {
+        if ctx.out.is_json() {
+            ctx.out.json_value(&json!({ "id": id, "propagated": 0, "children": 0 }))?;
+        } else {
+            ctx.out.line(format!("{id} has no labels to propagate"));
+        }
+        return Ok(());
+    }
+
+    let children: Vec<String> = store
+        .dependents_of(id)
+        .await?
+        .into_iter()
+        .filter(|d| d.dep_type == DependencyType::ParentChild)
+        .map(|d| d.issue_id)
+        .collect();
+
+    // What each child already has, in one query, so a re-run is cheap and adds
+    // nothing it need not.
+    let existing: std::collections::HashMap<String, Vec<String>> =
+        store.labels_of(&children).await?.into_iter().collect();
+
+    let mut added = 0u64;
+    for child in &children {
+        let have = existing.get(child).cloned().unwrap_or_default();
+        for label in &parent.labels {
+            if !have.contains(label) {
+                store.add_label(child, label).await?;
+                added += 1;
+            }
+        }
+    }
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&json!({
+            "id": id,
+            "labels": parent.labels,
+            "children": children.len(),
+            "propagated": added,
+        }))?;
+    } else {
+        ctx.out.line(format!(
+            "Propagated {} label(s) to {} child(ren): {} addition(s)",
+            parent.labels.len(),
+            children.len(),
+            added
+        ));
+    }
+    Ok(())
 }
 
 /// The seam has no per-issue existence check, and every mutation below needs
@@ -1407,12 +1474,54 @@ pub async fn restore(ctx: &Ctx, _id: &str) -> Result<()> {
     stub("restore", ctx)
 }
 
-pub async fn state(ctx: &Ctx, _id: &str) -> Result<()> {
-    stub("state", ctx)
+/// Show an issue's workflow state (its status). The read half of the custom-
+/// status workflow: `set-state` moves an issue through states this port does not
+/// hard-code, and `state` reads where it is.
+pub async fn state(ctx: &Ctx, id: &str) -> Result<()> {
+    let store = ctx.store().await?;
+    let issue = require_issue(store, id).await?;
+    if ctx.out.is_json() {
+        ctx.out.json_value(&json!({
+            "id": issue.id,
+            "state": issue.status.as_str(),
+            "category": format!("{:?}", issue.status.category()).to_lowercase(),
+        }))?;
+    } else {
+        ctx.out.line(format!("{}: {}", issue.id, issue.status.as_str()));
+    }
+    Ok(())
 }
 
-pub async fn set_state(ctx: &Ctx, _id: &str, _state: &str) -> Result<()> {
-    stub("set-state", ctx)
+/// Move an issue to a workflow state — a built-in status or a workspace-custom
+/// one. `Status::from` resolves a known name (`open`, `in_progress`, …) and
+/// carries anything else as [`Status::Custom`], so `bd set-state x reviewing`
+/// works without the port having to know what "reviewing" means.
+///
+/// Goes through `update_issue`, so it emits the same `status_changed` event and
+/// recomputes readiness exactly as `bd close`/`bd start` do — a custom state that
+/// happens to be closed-ish still gates work correctly.
+pub async fn set_state(ctx: &Ctx, id: &str, state: &str) -> Result<()> {
+    ctx.ensure_writable("set an issue's state")?;
+    let store = ctx.store().await?;
+    require_issue(store, id).await?;
+
+    let state = state.trim();
+    if state.is_empty() {
+        bail!("a state name cannot be empty");
+    }
+    let patch = IssuePatch {
+        status: Some(Status::from(state.to_string())),
+        ..Default::default()
+    };
+    let updated = store.update_issue(id, &patch).await?;
+
+    if ctx.out.is_json() {
+        ctx.out.json_value(&json!({ "id": updated.id, "state": updated.status.as_str() }))?;
+    } else {
+        ctx.out
+            .line(format!("{} is now {}", updated.id, updated.status.as_str()));
+    }
+    Ok(())
 }
 
 /// `bd promote`: a wisp becomes a real bead.
