@@ -3,8 +3,10 @@
 The command surface is **complete**: every command upstream has is registered,
 with its flags, aliases and help. What varies is what happens when you run one.
 
-**643 tests. Two backends: SQLite (complete) and Dolt (complete, unverified —
-see the bottom of this file).**
+**685 tests. Two backends, both complete and green: SQLite, and Dolt —
+**verified against real dolt 2.1.10** (100 bd-dolt tests run for real; nothing
+skips). Dolt's binary is a runtime dependency, not vendored; install it and it is
+on. See "Dolt: verified" at the bottom.**
 
 ## How to resume
 
