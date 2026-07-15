@@ -17,7 +17,7 @@ rust-version = "1.90"
 license = "MIT"
 # This port's own home. Upstream (github.com/gastownhall/beads) is the spec, not
 # the source, and is credited as such in the README.
-repository = "https://github.com/3x3xX3N0N/beads-in-rust"
+repository = "https://github.com/3x3xX3N0N/BIR"
 
 [workspace.dependencies]
 bd-core = { path = "crates/bd-core" }
