@@ -566,7 +566,16 @@ pub enum EventType {
 /// as the mutation that produced them — never after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    pub id: i64,
+    /// A client-minted UUID, **not** a per-workspace autoincrement integer.
+    ///
+    /// The integer was a latent corruption bug on any versioned backend: two
+    /// clones on separate branches would each allocate event `N+1`, and a merge
+    /// would collide two *different* events onto one primary key. A UUID is
+    /// globally unique, so the same event has the same id in every clone and a
+    /// merge is a clean union. (`Comment::id` is a UUID for exactly this reason;
+    /// events are the audit trail and had the same latent flaw.) Ordering moves
+    /// to `created_at`, since a UUID says nothing about when it was minted.
+    pub id: String,
     pub issue_id: String,
     pub event_type: EventType,
     pub actor: String,

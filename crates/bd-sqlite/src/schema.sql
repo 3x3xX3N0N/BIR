@@ -138,7 +138,10 @@ CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id, created_at);
 -- it describes: `delete_issue` records a `deleted` event, and an ON DELETE
 -- CASCADE would erase that event in the same statement that earned it.
 CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- A client-minted UUID, not AUTOINCREMENT. An autoincrement id collides on
+    -- merge between two clones (both allocate the same next integer for
+    -- different events); a UUID is the same everywhere and merges cleanly.
+    id         TEXT PRIMARY KEY,
     issue_id   TEXT NOT NULL,
     event_type TEXT NOT NULL,
     actor      TEXT NOT NULL DEFAULT '',
@@ -147,7 +150,8 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id, id);
+-- Ordered by created_at, because a UUID id no longer sorts chronologically.
+CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id, created_at);
 
 CREATE TABLE IF NOT EXISTS config (
     key   TEXT PRIMARY KEY,

@@ -222,7 +222,12 @@ CREATE TABLE IF NOT EXISTS comments (
 -- not work. Fixing it properly means widening `Event::id` to a string in
 -- bd-core, which is frozen.
 CREATE TABLE IF NOT EXISTS events (
-    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    -- A client-minted UUID, NOT AUTO_INCREMENT. Two clones on separate branches
+    -- would each allocate the same next integer for *different* events, and a
+    -- dolt merge would collide them on the primary key — corrupting the audit
+    -- trail exactly where version control is supposed to help. A UUID is the same
+    -- in every clone, so a merge is a clean union.
+    id         VARCHAR(36)  NOT NULL,
     issue_id   VARCHAR(255) NOT NULL,
     event_type VARCHAR(64)  NOT NULL,
     actor      VARCHAR(255) NOT NULL DEFAULT '',
@@ -231,7 +236,8 @@ CREATE TABLE IF NOT EXISTS events (
     created_at DATETIME(6)  NOT NULL,
 
     PRIMARY KEY (id),
-    KEY idx_events_issue (issue_id, id)
+    -- created_at, not id: a UUID does not sort chronologically.
+    KEY idx_events_issue (issue_id, created_at)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
 
 -- `key` is a *reserved word* in MySQL and must be quoted here and in every

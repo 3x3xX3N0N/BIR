@@ -1088,7 +1088,7 @@ impl Storage for SqliteStore {
     async fn list_events(&self, issue_id: &str) -> Result<Vec<Event>> {
         let rows = sqlx::query(
             "SELECT id, issue_id, event_type, actor, old_value, new_value, created_at
-             FROM events WHERE issue_id = ? ORDER BY id",
+             FROM events WHERE issue_id = ? ORDER BY created_at, id",
         )
         .bind(issue_id)
         .fetch_all(&self.pool)
@@ -1249,10 +1249,14 @@ impl SqliteStore {
     ) -> Result<()> {
         let kind = enum_to_str(&kind)
             .ok_or_else(|| Error::Db("event type is not a string".to_string()))?;
+        // Mint the id client-side (like comments), so the same event carries the
+        // same id in every clone and a merge never collides two events on one key.
+        let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(id)
         .bind(issue_id)
         .bind(kind)
         .bind(&self.identity.actor)
@@ -1284,11 +1288,17 @@ impl SqliteStore {
             at,
         )
         .await?;
+        // The terminal event is stamped one microsecond later so that
+        // `ORDER BY created_at` is a *total* order: since event ids became
+        // random UUIDs (merge-safety), there is no longer an insertion-order
+        // integer to break a same-timestamp tie, so the timestamp has to carry
+        // the order itself. StatusChanged happened, then it was recorded closed.
+        let then = at + chrono::Duration::microseconds(1);
         if new.is_closed() && !old.is_closed() {
-            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), at)
+            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), then)
                 .await?;
         } else if old.is_closed() && !new.is_closed() {
-            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, at)
+            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, then)
                 .await?;
         }
         Ok(())
