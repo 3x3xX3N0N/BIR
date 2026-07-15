@@ -15,9 +15,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
-# A clean-room port; upstream (github.com/gastownhall/beads) is the spec, not the
-# source. `repository` is intentionally unset until this port has its own home —
-# pointing it at upstream would claim to be a repo it is not.
+# This port's own home. Upstream (github.com/gastownhall/beads) is the spec, not
+# the source, and is credited as such in the README.
+repository = "https://github.com/3x3xX3N0N/beads-in-rust"
 
 [workspace.dependencies]
 bd-core = { path = "crates/bd-core" }
