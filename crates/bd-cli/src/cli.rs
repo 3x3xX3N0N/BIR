@@ -1182,7 +1182,13 @@ pub enum MolCmd {
     /// Molecules ready to work
     Ready,
     /// Instantiate a molecule from a template
-    Seed { template: String },
+    Seed {
+        template: String,
+        /// Bind a formula variable: `--var feature=auth`. Repeatable. Recorded on
+        /// the molecule so `pour` reuses the same bindings.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+    },
     Show { id: String },
     /// Collapse a molecule into one bead
     Squash { id: String },

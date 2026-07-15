@@ -27,11 +27,10 @@
 //! Pouring an already-poured molecule is refused rather than silently
 //! duplicating its steps.
 //!
-//! Neither command can bind `--var` today: `MolCmd::Seed`/`MolCmd::Pour` carry no
-//! variable flag, so a formula is bound with defaults only. A formula with a
-//! required, default-less variable therefore cannot be seeded — an honest exit 1
-//! naming the variable, not a half-made molecule. See the crate's port notes for
-//! the `--var` flag this wants.
+//! `seed` binds `--var KEY=VALUE` (like `bd cook`) and records the bindings on
+//! the molecule, so `pour` re-cooks with exactly what `seed` validated. A formula
+//! with a required, default-less variable that is not supplied fails at `seed`
+//! with an honest exit 1 naming the variable — before any molecule is planted.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +53,23 @@ use crate::output::issue_json;
 /// Where formulas live, relative to the workspace. Mirrors `formula.rs`.
 const FORMULA_DIR: &str = "formulas";
 
+/// `--var key=value` pairs into a map, the same rule `bd cook` uses. A malformed
+/// pair is a usage error naming it, never a silent skip that would leave a
+/// required variable unbound.
+fn parse_vars(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for p in pairs {
+        let (k, v) = p
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--var must be KEY=VALUE, got {p:?}"))?;
+        if k.is_empty() {
+            bail!("--var has an empty key: {p:?}");
+        }
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
 /// A molecule with no children older than this counts as `mol stale`.
 const STALE_AFTER_DAYS: i64 = 14;
 
@@ -66,7 +82,7 @@ const DEFAULT_WISP_TYPE: WispType = WispType::Patrol;
 pub async fn mol(ctx: &Ctx, cmd: MolCmd) -> Result<()> {
     match cmd {
         MolCmd::Wisp { title } => wisp(ctx, &title).await,
-        MolCmd::Seed { template } => seed(ctx, &template).await,
+        MolCmd::Seed { template, vars } => seed(ctx, &template, &vars).await,
         MolCmd::Pour { id } => pour(ctx, &id).await,
         MolCmd::Show { id } => show(ctx, &id).await,
         MolCmd::Ready => ready(ctx).await,
@@ -145,15 +161,18 @@ const MOL_META_KEY: &str = "molecule";
 /// (exit 2), a broken formula or missing required var is a plain failure (exit
 /// 1). Only then is the container created, carrying the formula's source so
 /// `pour` is self-contained.
-async fn seed(ctx: &Ctx, template: &str) -> Result<()> {
+async fn seed(ctx: &Ctx, template: &str, vars: &[String]) -> Result<()> {
     ctx.ensure_writable("seed a molecule")?;
 
     let path = resolve_formula(ctx, template)?;
     let src = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read formula {}", path.display()))?;
-    // Compile now to fail fast: a molecule you cannot pour is not worth planting.
+    let provided = parse_vars(vars)?;
+    // Compile now, with the caller's bindings, to fail fast: a required variable
+    // that was not supplied is caught here — an honest exit 1 naming it — rather
+    // than at `pour` time against a molecule already planted.
     let formula = bd_formula::parse(&src).map_err(formula_err)?;
-    let bindings = Bindings::bind(&formula, &BTreeMap::new()).map_err(formula_err)?;
+    let bindings = Bindings::bind(&formula, &provided).map_err(formula_err)?;
     let _plan = bd_formula::cook(&formula, &bindings).map_err(formula_err)?;
 
     let store = ctx.store().await?;
@@ -166,8 +185,15 @@ async fn seed(ctx: &Ctx, template: &str) -> Result<()> {
     container.description = formula.description.clone();
     container.issue_type = IssueType::Molecule;
     container.created_by = ctx.identity.actor.clone();
+    // The bindings are recorded next to the source, so `pour` re-cooks with
+    // exactly what `seed` validated — a molecule carries its whole recipe.
     container.metadata = Some(json!({
-        MOL_META_KEY: { "formula": formula.formula, "source": src, "poured": false }
+        MOL_META_KEY: {
+            "formula": formula.formula,
+            "source": src,
+            "vars": provided,
+            "poured": false,
+        }
     }));
     container.validate()?;
 
@@ -220,16 +246,30 @@ async fn pour(ctx: &Ctx, id: &str) -> Result<()> {
         .unwrap_or(container.title.as_str())
         .to_string();
 
+    // The bindings `seed` validated and recorded. An older molecule seeded before
+    // `--var` existed simply has none, which binds to defaults — the previous
+    // behaviour, preserved.
+    let recorded: BTreeMap<String, String> = meta
+        .get("vars")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
     let formula = bd_formula::parse(source).map_err(formula_err)?;
-    let bindings = Bindings::bind(&formula, &BTreeMap::new()).map_err(formula_err)?;
+    let bindings = Bindings::bind(&formula, &recorded).map_err(formula_err)?;
     let plan = bd_formula::cook(&formula, &bindings).map_err(formula_err)?;
 
     let created = materialize(ctx, store, &container.id, &plan).await?;
 
-    // Mark the container poured so a second pour cannot duplicate the work.
+    // Mark the container poured so a second pour cannot duplicate the work. The
+    // recorded source and vars are carried through unchanged.
     let patch = IssuePatch {
         metadata: Field::Set(json!({
-            MOL_META_KEY: { "formula": formula_name, "source": source, "poured": true }
+            MOL_META_KEY: {
+                "formula": formula_name,
+                "source": source,
+                "vars": recorded,
+                "poured": true,
+            }
         })),
         ..Default::default()
     };
