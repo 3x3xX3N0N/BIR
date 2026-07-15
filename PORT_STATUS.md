@@ -117,26 +117,29 @@ Things a future maintainer would otherwise rediscover the hard way.
    exactly this; it re-derives the value from the edges and diffs it against the
    stored column, and it is mutation-tested.
 
-2. **`bd_sqlite::blocked::recompute_all` cannot converge on a `parent-child`
-   cycle.** It seeds `unmark` from the very column it is fixing, so two mutually
-   parented issues each see the other as blocked and neither unmarks — forever,
-   even after the real blocker closes. `find_cycles` reports the cycle, but
-   `recompute_blocked()` returns success while `bd ready` still lies. The doctor
-   repair re-verifies from the edges afterwards and reports failure rather than
-   lying. **Unfixed.**
+2. **`recompute_all` is a *least* fixpoint** (reset all to unblocked, then
+   mark-only). This is what makes it correct on a `parent-child` **cycle**, which
+   a merge or import can land even though write paths reject them: from an
+   all-unblocked base a cycle with no external blocker never marks itself, and
+   monotonic marking always converges. The incremental path (`recompute_affected`,
+   on an already-correct acyclic graph) keeps its mark+unmark repair. *(Was a bug:
+   the old full recompute used mark+unmark and a cycle trapped it in a
+   stable-but-wrong "both blocked forever" state. Fixed; test:
+   `a_parent_child_cycle_is_recomputed_correctly_not_just_without_spinning`.)*
 
-3. **`events.id` is an `AUTO_INCREMENT` integer.** On Dolt, two clones on separate
-   branches both allocate id N+1, and merging is a genuine key conflict between
-   rows that are not the same event. Confined to the audit trail (nothing joins
-   on an event id). The real fix is widening `bd_core::Event::id` to a `String`,
-   as `Comment::id` already was for the same reason. **Unfixed.**
+3. **`events.id` is a client-minted UUID**, not an autoincrement integer — so a
+   Dolt merge between two clones is a clean union rather than a primary-key
+   collision between two different events. Event listing orders by `created_at`;
+   a multi-event mutation stamps its terminal event one microsecond later so the
+   order is total and deterministic. *(Was a bug; fixed.)*
 
-4. **The lock format records a pid but no hostname.** On a `.beads/` sitting on a
-   network share, a lock written by another machine gets its pid checked against
-   the *local* process table, can read as dead, and `doctor --fix` would delete a
-   lock whose owner is alive elsewhere. The doctor check is deliberately
-   conservative about this. The fix belongs in the lock *writer*: record `host=`
-   alongside `pid=`. **Unfixed.**
+4. **The lock sweeper refuses to delete a lock from another machine.** A lock may
+   carry `host=`; on a shared/network `.beads/` a foreign host's pid names a
+   process in a table this machine cannot see, so such a lock is `Undetermined`
+   (reported, never deleted) regardless of the local pid probe. A lock with no
+   `host=` keeps pid-only behaviour. *(Was a bug: a foreign lock whose pid was
+   dead locally read as orphaned and `doctor --fix` would delete it. Fixed in the
+   reader; a future beads lock-writer should record `host=`.)*
 
 5. **`list_issues` does not hydrate relations.** Only `get_issue` returns labels
    and edges. So `bd list --json` carries no `labels` array while `bd show --json`
