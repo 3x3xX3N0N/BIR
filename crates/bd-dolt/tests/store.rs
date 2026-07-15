@@ -124,6 +124,13 @@ async fn harness(db: &str) -> Option<Fixture> {
     }
 
     let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+    // No `--user`: dolt 2.x removed it from `sql-server` and errors out if it is
+    // passed, so the server would never start and every test here would skip for
+    // a reason that looks like "dolt is absent". A passwordless `root` is
+    // auto-provisioned; that is who the DSN connects as. The server's log goes to
+    // a file rather than `/dev/null` so a future startup failure is diagnosable
+    // instead of a silent 10-second poll-then-skip.
+    let log = std::fs::File::create(dir.join("server.log")).ok();
     let spawned = Command::new("dolt")
         .current_dir(&dir)
         .args([
@@ -132,47 +139,47 @@ async fn harness(db: &str) -> Option<Fixture> {
             "127.0.0.1",
             "--port",
             &port.to_string(),
-            "--user",
-            "root",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null))
         .spawn();
     let server = match spawned {
         Ok(c) => ServerGuard(c),
         Err(e) => return skip(&format!("could not spawn `dolt sql-server`: {e}")),
     };
 
-    // `dolt init` names the database after its directory, with everything that
-    // is not alphanumeric folded to an underscore.
-    let dbname: String = dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    let url = format!("mysql://root@127.0.0.1:{port}/{dbname}");
+    // Do NOT guess the database name. `dolt init` names the database after its
+    // directory, and the folding rule is not the obvious one — dolt *keeps*
+    // dashes (`bd-dolt-x` stays `bd-dolt-x`, it does not become `bd_dolt_x`), so
+    // a fold-to-underscore guess connects to a database that does not exist and
+    // fails with 1049. This is the same trap the production `open` path avoids by
+    // asking the server; the harness asks it too.
+    let base = format!("mysql://root@127.0.0.1:{port}/");
 
-    // Binding the port takes a moment. Poll for it rather than sleeping a
-    // guessed interval and hoping.
+    // Binding the port and provisioning the database take a moment. Poll rather
+    // than sleeping a guessed interval.
     let mut last = String::new();
     for _ in 0..40 {
-        match DoltStore::connect(&url, identity.clone(), &dir).await {
-            Ok(store) => {
-                return Some(Fixture {
-                    store,
-                    _server: Some(server),
-                    _dir: Some(dir),
-                });
+        match discover_db(&base).await {
+            Ok(Some(dbname)) => {
+                let url = format!("{base}{dbname}");
+                match DoltStore::connect(&url, identity.clone(), &dir).await {
+                    Ok(store) => {
+                        return Some(Fixture {
+                            store,
+                            _server: Some(server),
+                            _dir: Some(dir),
+                        });
+                    }
+                    Err(e) => last = format!("connecting to {url}: {e}"),
+                }
             }
-            Err(e) => {
-                last = e.to_string();
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
+            Ok(None) => last = "server up but serving no user database yet".to_string(),
+            Err(e) => last = e,
         }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    skip(&format!("`dolt sql-server` never came up on {url}: {last}"))
+    skip(&format!("`dolt sql-server` never came up on {base}: {last}"))
 }
 
 /// Give each test its own database on a shared server.
@@ -191,6 +198,34 @@ async fn provision(base_url: &str, db: &str) -> Result<String, String> {
 
     let (head, _) = base_url.rsplit_once('/').ok_or("no path in the url")?;
     Ok(format!("{head}/{db}"))
+}
+
+/// Ask the server what database it is serving, rather than deriving the name.
+///
+/// Returns `Ok(None)` while the server is still coming up (no user database yet),
+/// which the caller treats as "poll again", and `Err` only for a real connection
+/// failure. Mirrors the production `discover_database`: the one user database is
+/// the workspace's; the rest are dolt's own system schemas.
+async fn discover_db(base_url: &str) -> Result<Option<String>, String> {
+    let pool = bd_dolt::store::connect_pool(base_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = sqlx::query_scalar("SHOW DATABASES")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    pool.close().await;
+
+    const SYSTEM: &[&str] = &[
+        "information_schema",
+        "mysql",
+        "performance_schema",
+        "sys",
+        "dolt_cluster",
+    ];
+    Ok(names
+        .into_iter()
+        .find(|n| !SYSTEM.contains(&n.to_ascii_lowercase().as_str())))
 }
 
 fn dolt(dir: &Path, args: &[&str]) -> Result<(), String> {
@@ -286,11 +321,21 @@ async fn an_issue_round_trips_through_every_column() {
     assert_eq!(got.labels, vec!["a".to_string(), "b".to_string()]);
     assert!(!got.content_hash.is_empty());
 
-    // DATETIME(6) keeps microseconds. A bare DATETIME truncates to the second,
-    // which would collapse lease expiry and the (created_at, id) sort tiebreak
-    // onto a one-second grid — so this assertion is load-bearing, not pedantic.
+    // DATETIME(6) keeps sub-second precision. A bare DATETIME truncates to the
+    // whole second, which would collapse lease expiry and the (created_at, id)
+    // sort tiebreak onto a one-second grid — so this assertion is load-bearing.
+    //
+    // What it must NOT be is flaky. `Utc::now()` carries nanoseconds; DATETIME(6)
+    // carries microseconds, and dolt rounds rather than truncates at that
+    // boundary — so a tolerance of a microsecond or two occasionally tips over on
+    // an unlucky wall-clock value, with no bug behind it. The failure this guards
+    // against is a *thousandfold* larger (a whole second = 1_000_000µs), so the
+    // tolerance is set well below that and well above the rounding noise.
     let drift = (got.created_at - i.created_at).num_microseconds().unwrap();
-    assert!(drift.abs() <= 1, "timestamp precision lost: {drift}µs");
+    assert!(
+        drift.abs() < 1000,
+        "sub-second precision lost — DATETIME(6) may have degraded to DATETIME: {drift}µs"
+    );
 }
 
 /// The reason `schema.sql` pins `utf8mb4_0900_bin`. Under MySQL's *default*

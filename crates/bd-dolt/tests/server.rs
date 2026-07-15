@@ -167,7 +167,7 @@ async fn dolt_gets_an_identity_before_it_needs_one() {
     require_dolt!();
     let dir = workspace("identity").await;
 
-    ensure_identity(&dir)
+    ensure_identity(&dir, None)
         .await
         .expect("dolt init set one, so this is a no-op");
 

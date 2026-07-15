@@ -192,26 +192,45 @@ impl VersionControl for DoltStore {
                 }
             })?;
 
+        // Try to make the checkout the default branch for *future* sessions too.
+        //
+        // This is now belt-and-suspenders, not correctness: the store's pool is
+        // pinned to a single connection (see `store::connect_pool`), so
+        // `CALL DOLT_CHECKOUT` above moved the only session there is, and no
+        // sibling connection can be left on the old branch. The global default
+        // only matters across a *reconnect* (the process restarts, a new session
+        // opens), and it is a genuine nicety there.
+        //
+        // But it must not be a hard error, because the SET requires the database
+        // name to be a plain SQL identifier and beads' names are not: `.beads`
+        // begins with a dot, and dolt keeps dashes. When the name will not quote,
+        // this is skipped, not failed — the single connection already guarantees
+        // the checkout holds for this process. (Verification found this: every
+        // real workspace name tripped the old hard error.)
         let database = sqlx::query_scalar::<_, Option<String>>("SELECT DATABASE()")
             .fetch_one(&mut *c)
             .await
             .map_err(db)?
-            .ok_or_else(|| bad("the dolt connection has no database selected".to_string()))?;
+            .unwrap_or_default();
 
-        // A system-variable *name* cannot be a bind parameter, and the value is
-        // spliced for the same reason `rev_literal` exists. Both halves are
-        // validated, never escaped.
-        let var = default_branch_var(&database)?;
-        sqlx::query(&format!("SET {var} = {branch}"))
-            .execute(&mut *c)
-            .await
-            .map_err(|e| {
-                Error::Db(format!(
-                    "checked out {name}, but could not make it the default branch for new \
-                     connections ({var}): {e}. Other pooled connections are still on the old \
-                     branch, so this workspace is now inconsistent — reopen it before writing."
-                ))
-            })?;
+        match default_branch_var(&database) {
+            Ok(var) => {
+                if let Err(e) = sqlx::query(&format!("SET {var} = {branch}"))
+                    .execute(&mut *c)
+                    .await
+                {
+                    tracing::debug!(
+                        "checked out {name}; could not set the default branch for new \
+                         connections ({var}): {e}. The single-connection pool makes this \
+                         harmless for the current process."
+                    );
+                }
+            }
+            Err(_) => tracing::debug!(
+                "checked out {name}; database name {database:?} is not a plain identifier, so \
+                 the default-branch hint is skipped. Harmless: the pool holds one connection."
+            ),
+        }
 
         Ok(())
     }
@@ -300,6 +319,21 @@ impl VersionControl for DoltStore {
         let mut c = self.vc_conn().await?;
 
         let before = head_hash(&mut c).await?;
+
+        // Let a conflicting merge *land its conflicts* rather than roll back.
+        //
+        // Under dolt's default `@autocommit`, `CALL DOLT_MERGE` that hits a
+        // conflict rolls the whole transaction back and returns error 1105 — so
+        // the conflict never reaches `dolt_conflicts`, and `bd merge` would report
+        // a genuine, resolvable conflict as an opaque failure. Setting this lets
+        // the merge commit with the conflicts present, which is exactly what the
+        // classifier below wants to read. (Verification found this: a real
+        // conflicting merge errored instead of returning `Conflicted`.)
+        sqlx::query("SET @@dolt_allow_commit_conflicts = 1")
+            .execute(&mut *c)
+            .await
+            .map_err(db)?;
+
         let rows = call(
             &mut c,
             sqlx::query("CALL DOLT_MERGE(?, '--author', ?)")

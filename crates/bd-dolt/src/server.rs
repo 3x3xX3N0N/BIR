@@ -28,7 +28,7 @@
 //!    own it; [`Drop`] then leaves it alone. Ownership is explicit, never guessed.
 
 use bd_storage::error::anyhow_lite;
-use bd_storage::{Error, Result};
+use bd_storage::{Error, Identity, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
@@ -138,7 +138,7 @@ impl DoltServer {
         // Not fatal here: reads work fine without an identity. It is fatal at
         // `CALL DOLT_COMMIT()`, which is why `ensure_identity` is public and the
         // commit path is expected to call it and *propagate* the error.
-        if let Err(e) = ensure_identity(&dir).await {
+        if let Err(e) = ensure_identity(&dir, None).await {
             tracing::warn!("dolt has no commit identity: {e}");
         }
 
@@ -446,7 +446,7 @@ impl Drop for DoltServer {
 /// Scope: `--local` once the directory is a dolt repo (nothing leaks onto the
 /// user's machine), `--global` before that — `--local` has nowhere to write until
 /// `.dolt/` exists, and `dolt init` itself needs the identity.
-pub async fn ensure_identity(dir: &Path) -> Result<()> {
+pub async fn ensure_identity(dir: &Path, fallback: Option<&Identity>) -> Result<()> {
     let dolt = crate::which_dolt().ok_or_else(|| other("no `dolt` binary on PATH"))?;
     let scope = if dir.join(".dolt").is_dir() {
         "--local"
@@ -458,12 +458,24 @@ pub async fn ensure_identity(dir: &Path) -> Result<()> {
         if config_get(&dolt, dir, key).await.is_some() {
             continue;
         }
-        let Some(value) = git_config_get(dir, key).await else {
-            return Err(other(format!(
-                "dolt has no {key} and git has none to borrow. Set one:\n  \
-                 git config --global {key} \"...\"\n  or\n  \
-                 dolt config --global --add {key} \"...\""
-            )));
+        // dolt → git → the beads actor. The last one is why this takes a
+        // fallback: beads has *already* resolved who is acting (flag, env,
+        // config, git, in that order), so a machine with no *global* git
+        // identity — which is most CI, and was the machine these tests first ran
+        // on — must not stop `bd init --backend=dolt`. beads knows who you are;
+        // dolt should commit as that person rather than refuse.
+        let value = match git_config_get(dir, key).await {
+            Some(v) => v,
+            None => match fallback.map(|id| derive_identity(id, key)) {
+                Some(v) => v,
+                None => {
+                    return Err(other(format!(
+                        "dolt has no {key} and there is nothing to borrow. Set one:\n  \
+                         git config --global {key} \"...\"\n  or\n  \
+                         dolt config --global --add {key} \"...\""
+                    )));
+                }
+            },
         };
         let out = Command::new(&dolt)
             .args(["config", scope, "--add", key, &value])
@@ -509,6 +521,35 @@ async fn git_config_get(dir: &Path, key: &str) -> Option<String> {
 
 fn stdout_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+/// Dolt's `user.name` / `user.email`, derived from the beads actor.
+///
+/// The actor is often already an email (`Identity` documents it as "an agent
+/// name or a git email"). When it is, it serves as the email directly and its
+/// local-part as the name; when it is a bare name, we synthesize a stable,
+/// obviously-synthetic address rather than leave dolt without one.
+fn derive_identity(id: &Identity, key: &str) -> String {
+    let actor = if id.actor.trim().is_empty() {
+        "beads"
+    } else {
+        id.actor.trim()
+    };
+    match key {
+        "user.email" => {
+            if actor.contains('@') {
+                actor.to_string()
+            } else {
+                let slug: String = actor
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                    .collect();
+                format!("{slug}@beads.local")
+            }
+        }
+        // user.name: the actor, or its local-part if the actor is an email.
+        _ => actor.split('@').next().unwrap_or(actor).to_string(),
+    }
 }
 
 fn non_empty(s: String) -> Option<String> {

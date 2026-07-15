@@ -368,7 +368,40 @@ impl<'a> Dx<'a> {
     /// hard error either. "The database is unopenable" is somebody else's
     /// finding to report (see the Core family); your check's job is to say that
     /// *it* could not run.
+    ///
+    /// # Doctor does not start a Dolt server
+    ///
+    /// Opening a Dolt store spawns (or adopts) a `dolt sql-server` subprocess.
+    /// `bd doctor` is the command you run *when a workspace is wedged* — and
+    /// starting a second server against a locked database is the exact lock
+    /// collision this command exists to diagnose, not cause. It also mutates the
+    /// workspace mid-diagnosis (a server writes its log and pid record), which a
+    /// read-only inspection must not do.
+    ///
+    /// So on a Dolt workspace this refuses to *open* a store, returning `None`
+    /// with an explanatory [`store_error`]. If a store is already open (a prior
+    /// command in the same process opened it), that one is used. SQLite has no
+    /// such side effect and opens normally.
+    ///
+    /// [`store_error`]: Dx::store_error
     pub async fn store(&self) -> Option<&dyn Storage> {
+        // An already-open store is free to use, whatever the backend.
+        if let Some(s) = self.ctx.try_store() {
+            return Some(s);
+        }
+        if self.ctx.backend() == Some(bd_storage::Backend::Dolt) {
+            self.probe
+                .get_or_init(|| async {
+                    Some(
+                        "doctor will not start a dolt sql-server to inspect the graph — that is \
+                         the lock collision it exists to diagnose. Run a command that opens the \
+                         workspace (e.g. `bd ready`) if you need this check."
+                            .to_string(),
+                    )
+                })
+                .await;
+            return None;
+        }
         self.probe
             .get_or_init(|| async { self.ctx.store().await.err().map(|e| format!("{e:#}")) })
             .await;

@@ -106,7 +106,7 @@ pub async fn init(dir: &Path, prefix: &str, identity: Identity) -> Result<Box<dy
     // refuses to run without a `user.name`/`user.email`, and `dolt config
     // --local` has nowhere to write until `.dolt/` exists. `ensure_identity`
     // handles exactly that: `--global` before the repo, `--local` after.
-    server::ensure_identity(dir).await?;
+    server::ensure_identity(dir, Some(&identity)).await?;
 
     if !dir.join(".dolt").is_dir() {
         run_dolt(&dolt, dir, &["init"]).await?;
@@ -132,7 +132,7 @@ pub async fn open(locator: &Locator, identity: Identity) -> Result<Box<dyn Stora
             dir.display()
         )));
     }
-    server::ensure_identity(dir).await?;
+    server::ensure_identity(dir, Some(&identity)).await?;
     Ok(Box::new(open_at(dir, identity).await?))
 }
 
