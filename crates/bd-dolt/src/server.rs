@@ -544,14 +544,20 @@ fn spawn(dolt: &Path, dir: &Path, port: u16, log: &Path) -> Result<Child> {
 /// the difference between serving the workspace and serving whatever happens to
 /// be under the shell.
 fn sql_server_args(dir: &Path, port: u16) -> Vec<OsString> {
+    // No `--user`/`--password`. Dolt removed both from `sql-server` (they error
+    // out as of 2.x — "Create users explicitly with CREATE USER and GRANT"), and
+    // a server with no configured users auto-provisions a passwordless `root`
+    // superuser on first start. That is exactly the identity the DSN connects as
+    // ([`DoltServer::dsn`]), and it is safe only because the listener is bound to
+    // loopback and the database is locked to this one process — do not widen the
+    // host. This was caught the first time these tests ran against a real dolt;
+    // the flags had been carried over from an older CLI.
     vec![
         OsString::from("sql-server"),
         OsString::from("--host"),
         OsString::from("127.0.0.1"),
         OsString::from("--port"),
         OsString::from(port.to_string()),
-        OsString::from("--user"),
-        OsString::from("root"),
         OsString::from("--data-dir"),
         dir.as_os_str().to_owned(),
     ]
