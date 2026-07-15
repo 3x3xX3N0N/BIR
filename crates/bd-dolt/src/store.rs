@@ -111,7 +111,27 @@ impl DoltStore {
             identity,
             server,
             dir: dir.into(),
+            event_clock: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// The next event timestamp: at least `at`, always strictly greater than the
+    /// last one this store handed out. See [`crate::DoltStore::event_clock`].
+    fn next_event_time(&self, at: DateTime<Utc>) -> DateTime<Utc> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let want = at.timestamp_nanos_opt().unwrap_or(0);
+        let mut cur = self.event_clock.load(Relaxed);
+        let stamp = loop {
+            let next = want.max(cur + 1);
+            match self
+                .event_clock
+                .compare_exchange_weak(cur, next, Relaxed, Relaxed)
+            {
+                Ok(_) => break next,
+                Err(actual) => cur = actual,
+            }
+        };
+        DateTime::from_timestamp_nanos(stamp)
     }
 
     /// Connect to an already-running server and make sure the schema is there.
@@ -1497,6 +1517,8 @@ impl DoltStore {
         // Client-minted UUID, so a merge between clones is a clean union rather
         // than a primary-key collision between two different events.
         let id = uuid::Uuid::new_v4().to_string();
+        // Strictly-increasing timestamp so the audit trail totally orders.
+        let at = self.next_event_time(at);
         sqlx::query(
             "INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1533,14 +1555,13 @@ impl DoltStore {
             at,
         )
         .await?;
-        // One microsecond later, so `ORDER BY created_at` totally orders events
-        // that share a mutation — the random UUID id can no longer break the tie.
-        let then = at + chrono::Duration::microseconds(1);
+        // The store's monotonic event clock orders the terminal event after the
+        // StatusChanged on its own; the caller need not stagger `at`.
         if new.is_closed() && !old.is_closed() {
-            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), then)
+            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), at)
                 .await?;
         } else if old.is_closed() && !new.is_closed() {
-            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, then)
+            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, at)
                 .await?;
         }
         Ok(())

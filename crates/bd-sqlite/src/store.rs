@@ -26,11 +26,45 @@ const ORDERING_EDGES: [&str; 2] = ["blocks", "parent-child"];
 pub struct SqliteStore {
     pool: SqlitePool,
     identity: Identity,
+    /// A monotonic clock for event timestamps, in nanoseconds.
+    ///
+    /// Events are ordered by `created_at` (a UUID id no longer sorts
+    /// chronologically), and `Utc::now()` is *not* strictly increasing — on
+    /// Windows especially its resolution is coarse, so several mutations fired in
+    /// a tight loop can share a timestamp, and the audit trail then comes back
+    /// scrambled. This makes every event's `created_at` strictly greater than the
+    /// last, so the order is total. The integer id used to give this for free;
+    /// it is bought back here rather than reintroduced (an integer id collides on
+    /// merge).
+    event_clock: std::sync::atomic::AtomicI64,
 }
 
 impl SqliteStore {
     pub(crate) fn new(pool: SqlitePool, identity: Identity) -> Self {
-        SqliteStore { pool, identity }
+        SqliteStore {
+            pool,
+            identity,
+            event_clock: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// The next event timestamp: at least `at`, and always strictly greater than
+    /// any timestamp this store has handed out before.
+    fn next_event_time(&self, at: DateTime<Utc>) -> DateTime<Utc> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let want = at.timestamp_nanos_opt().unwrap_or(0);
+        let mut cur = self.event_clock.load(Relaxed);
+        let stamp = loop {
+            let next = want.max(cur + 1);
+            match self
+                .event_clock
+                .compare_exchange_weak(cur, next, Relaxed, Relaxed)
+            {
+                Ok(_) => break next,
+                Err(actual) => cur = actual,
+            }
+        };
+        DateTime::from_timestamp_nanos(stamp)
     }
 }
 
@@ -1252,6 +1286,9 @@ impl SqliteStore {
         // Mint the id client-side (like comments), so the same event carries the
         // same id in every clone and a merge never collides two events on one key.
         let id = uuid::Uuid::new_v4().to_string();
+        // Strictly-increasing timestamp, so `ORDER BY created_at` is a total order
+        // even when several events land in one clock tick.
+        let at = self.next_event_time(at);
         sqlx::query(
             "INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1288,17 +1325,15 @@ impl SqliteStore {
             at,
         )
         .await?;
-        // The terminal event is stamped one microsecond later so that
-        // `ORDER BY created_at` is a *total* order: since event ids became
-        // random UUIDs (merge-safety), there is no longer an insertion-order
-        // integer to break a same-timestamp tie, so the timestamp has to carry
-        // the order itself. StatusChanged happened, then it was recorded closed.
-        let then = at + chrono::Duration::microseconds(1);
+        // The terminal event orders after the StatusChanged automatically:
+        // `event()` runs every timestamp through the store's monotonic clock, so
+        // two events emitted for one status move are strictly ordered without the
+        // caller having to stagger `at`.
         if new.is_closed() && !old.is_closed() {
-            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), then)
+            self.event(conn, id, EventType::Closed, None, Some(new.as_str()), at)
                 .await?;
         } else if old.is_closed() && !new.is_closed() {
-            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, then)
+            self.event(conn, id, EventType::Reopened, Some(old.as_str()), None, at)
                 .await?;
         }
         Ok(())

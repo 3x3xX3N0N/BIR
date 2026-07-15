@@ -76,6 +76,12 @@ pub struct DoltStore {
     pub(crate) server: Option<server::DoltServer>,
     /// The `.beads` directory.
     pub(crate) dir: PathBuf,
+    /// A monotonic clock (nanoseconds) for event timestamps, so `ORDER BY
+    /// created_at` totally orders the audit trail even when several events land
+    /// in one clock tick. See the SQLite store for the full reasoning; the event
+    /// id is a UUID (merge-safe) and no longer sorts by time, so the timestamp
+    /// carries the order.
+    pub(crate) event_clock: std::sync::atomic::AtomicI64,
 }
 
 impl DoltStore {
