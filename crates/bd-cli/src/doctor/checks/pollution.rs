@@ -280,27 +280,65 @@ fn is_lock_name(name: &str) -> bool {
     name.ends_with(".lock") || name.ends_with(".startlock")
 }
 
-/// Beads writes `pid=<n>\nstarted=<rfc3339>\n`. Anything else is [`Lock::Anonymous`].
-fn lock_pid(body: &str) -> Option<u32> {
+/// A `key=value` line's value, trimmed. Beads writes `pid=<n>\nstarted=<rfc3339>\n`
+/// and, when it can, `host=<name>`.
+fn lock_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     body.lines()
         .filter_map(|l| l.trim().split_once('='))
-        .find(|(k, _)| k.trim() == "pid")
-        .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim())
+}
+
+fn lock_pid(body: &str) -> Option<u32> {
+    lock_field(body, "pid")
+        .and_then(|v| v.parse::<u32>().ok())
         .filter(|p| *p > 0)
 }
 
+/// This machine's name, for comparing against a lock's `host=`. `None` if it
+/// cannot be determined — in which case any host-bearing lock is treated as
+/// foreign, which is the safe direction (decline to delete).
+fn local_host() -> Option<String> {
+    #[cfg(windows)]
+    let raw = std::env::var("COMPUTERNAME").ok();
+    #[cfg(not(windows))]
+    let raw = std::env::var("HOSTNAME").ok().or_else(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+            .ok()
+    });
+    raw.map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+}
+
 /// Pure, so the interesting cases are unit-testable without spawning processes.
-fn classify(body: &str, life: &dyn Fn(u32) -> Life) -> Lock {
+///
+/// `local` is this machine's name (see [`local_host`]). It exists for the one
+/// case a pid probe cannot handle: a lock written on **another machine** against
+/// a shared or network filesystem. Its pid names a process in a process table we
+/// cannot see, so probing it locally is meaningless — a foreign pid that happens
+/// not to exist here would read as `Orphaned` and `--fix` would delete a lock
+/// whose owner is alive elsewhere. A lock whose `host=` is not ours is therefore
+/// [`Lock::Undetermined`] no matter what the local probe says: reported, never
+/// deleted. A lock with no `host=` is the old format and stays pid-only.
+fn classify(body: &str, local: Option<&str>, life: &dyn Fn(u32) -> Life) -> Lock {
     if body.trim().is_empty() {
         return Lock::Released;
     }
-    match lock_pid(body) {
-        None => Lock::Anonymous,
-        Some(pid) => match life(pid) {
-            Life::Alive => Lock::Held(pid),
-            Life::Dead => Lock::Orphaned(pid),
-            Life::Unknown => Lock::Undetermined(pid),
-        },
+    let pid = match lock_pid(body) {
+        None => return Lock::Anonymous,
+        Some(pid) => pid,
+    };
+    // A recorded host that is not ours: the process is not in our table.
+    if let Some(host) = lock_field(body, "host").map(|h| h.to_ascii_lowercase())
+        && local.map(|l| l != host).unwrap_or(true)
+    {
+        return Lock::Undetermined(pid);
+    }
+    match life(pid) {
+        Life::Alive => Lock::Held(pid),
+        Life::Dead => Lock::Orphaned(pid),
+        Life::Unknown => Lock::Undetermined(pid),
     }
 }
 
@@ -313,12 +351,13 @@ struct Found {
 
 fn scan_locks(beads: &Path, life: &dyn Fn(u32) -> Life) -> std::io::Result<Vec<Found>> {
     let mut out = Vec::new();
+    let local = local_host();
     for (name, path, md) in shallow(beads)? {
         if !md.is_file() || !is_lock_name(&name) {
             continue;
         }
         let state = match std::fs::read_to_string(&path) {
-            Ok(body) => classify(&body, life),
+            Ok(body) => classify(&body, local.as_deref(), life),
             Err(e) => Lock::Unreadable(e.to_string()),
         };
         out.push(Found {
@@ -1195,8 +1234,8 @@ mod tests {
     #[test]
     fn a_lock_whose_owner_is_alive_is_held_not_stale() {
         let body = "pid=4242\nstarted=2026-07-14T12:00:00Z\n";
-        assert_eq!(classify(body, &|_| Life::Alive), Lock::Held(4242));
-        assert_eq!(classify(body, &|_| Life::Dead), Lock::Orphaned(4242));
+        assert_eq!(classify(body, None, &|_| Life::Alive), Lock::Held(4242));
+        assert_eq!(classify(body, None, &|_| Life::Dead), Lock::Orphaned(4242));
     }
 
     /// "I could not tell" must never collapse into "it is dead". On a machine
@@ -1205,7 +1244,7 @@ mod tests {
     #[test]
     fn an_undeterminable_owner_is_not_a_dead_one() {
         let body = "pid=4242\n";
-        let state = classify(body, &|_| Life::Unknown);
+        let state = classify(body, None, &|_| Life::Unknown);
         assert_eq!(state, Lock::Undetermined(4242));
         assert!(
             !matches!(state, Lock::Orphaned(_)),
@@ -1219,16 +1258,44 @@ mod tests {
     /// which is precisely the bug in upstream's age-only check.
     #[test]
     fn an_empty_lock_file_is_released_and_never_touched() {
-        assert_eq!(classify("", &|_| Life::Dead), Lock::Released);
-        assert_eq!(classify("\n  \n", &|_| Life::Dead), Lock::Released);
+        assert_eq!(classify("", None, &|_| Life::Dead), Lock::Released);
+        assert_eq!(classify("\n  \n", None, &|_| Life::Dead), Lock::Released);
     }
 
     #[test]
     fn a_lock_with_no_pid_is_anonymous_rather_than_assumed_dead() {
-        assert_eq!(classify("locked by something else\n", &|_| Life::Dead), Lock::Anonymous);
+        assert_eq!(classify("locked by something else\n", None, &|_| Life::Dead), Lock::Anonymous);
         assert_eq!(lock_pid("pid=0\n"), None, "pid 0 is not a process");
         assert_eq!(lock_pid("pid=abc\n"), None);
         assert_eq!(lock_pid("pid=17\nstarted=x\n"), Some(17));
+    }
+
+    /// The network-share bug. A lock written by another machine records its own
+    /// `host=`, and its pid names a process in a table we cannot see. Probing it
+    /// locally is meaningless: the pid may not exist here even though the owner is
+    /// alive over there. So a foreign host is `Undetermined` — reported, never
+    /// deleted — **even when the local probe says the pid is dead**, which is the
+    /// exact case that used to authorize `--fix` to delete a live lock.
+    #[test]
+    fn a_lock_from_another_machine_is_never_called_orphaned() {
+        let body = "pid=4242\nhost=build-server-07\nstarted=2026-07-14T12:00:00Z\n";
+        // We are "my-laptop"; the lock is from "build-server-07". Even though the
+        // local probe reports Dead, it must not be Orphaned.
+        let state = classify(body, Some("my-laptop"), &|_| Life::Dead);
+        assert_eq!(state, Lock::Undetermined(4242));
+        assert!(
+            !matches!(state, Lock::Orphaned(_)),
+            "a foreign-host lock must never be deletable, whatever the local pid probe says"
+        );
+
+        // Same machine (case-insensitively): fall back to the pid probe as before.
+        let ours = "pid=4242\nhost=My-Laptop\n";
+        assert_eq!(classify(ours, Some("my-laptop"), &|_| Life::Dead), Lock::Orphaned(4242));
+        assert_eq!(classify(ours, Some("my-laptop"), &|_| Life::Alive), Lock::Held(4242));
+
+        // And if we cannot determine our own host, treat any host-bearing lock as
+        // foreign — the safe direction.
+        assert_eq!(classify(body, None, &|_| Life::Dead), Lock::Undetermined(4242));
     }
 
     #[test]
