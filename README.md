@@ -30,6 +30,51 @@ bd ready              # implement the API   (now unblocked)
 
 Everything speaks `--json` for scripts and agents.
 
+## Ultraphrenia — many sessions on one board
+
+Beads is built for *more than one* agent working the same graph at once
+(*ultraphrenia*: many minds, one board). No session needs to know another
+exists — the board is the coordinator. Every session asks the same question,
+`bd ready`, takes work by **claiming** it, and a claim is a **lease**: you hold it
+while you work, and if your session dies the lease lapses and the work returns to
+the pool. Two sessions never pick up the same issue, because `bd ready` only
+offers work that is unblocked *and* unclaimed.
+
+**Install once; every workspace shares the one binary.**
+
+```bash
+cargo install --git https://github.com/3x3xX3N0N/BIR bd-cli   # -> ~/.cargo/bin/bd
+cd any-project && bd init --prefix proj                        # one .beads/ per project
+```
+
+**Every session runs the same four-line loop** — this is the whole protocol:
+
+```bash
+bd ready --json                 # 1. unblocked AND unclaimed work; pick one
+bd update <id> --claim          # 2. take it (a lease; add --lease 2h to hold longer)
+#   ... do the work; bd comment <id> "<finding>" as you learn ...
+bd close <id> --reason done     # 4. closing a blocker makes its dependents ready
+```
+
+Skip step 2 and two sessions collide on one issue; skip step 4 and everything
+downstream stays blocked. `bd setup` writes this loop into your agent's
+instructions file, and `bd prime` prints it plus the current board in one screen.
+
+**Give each session an identity** so claims and the audit trail record *who*:
+
+```bash
+export BEADS_ACTOR=agent-web     # recorded on every claim and event
+export BEADS_SESSION=web-run-1   # any string unique to this run
+```
+
+**A long job outlives its lease?** `bd heartbeat <id>` (alias `bd hb`) renews it.
+**A session died holding claims?** `bd reclaim` returns every lapsed lease to the
+pool; `bd gc` sweeps lapsed leases and expired wisps as routine housekeeping.
+
+A drop-in Claude Code skill that teaches an agent this whole flow ships in
+[`skills/bd/`](skills/bd/SKILL.md) — copy it to `~/.claude/skills/bd/` and any
+agent, in any workspace, can install and drive `bd` on its own.
+
 ## What works
 
 - **The whole core loop** — create/update/close, dependencies, `ready`/`blocked`,
