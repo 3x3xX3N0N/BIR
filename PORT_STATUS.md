@@ -3,7 +3,7 @@
 The command surface is **complete**: every command upstream has is registered,
 with its flags, aliases and help. What varies is what happens when you run one.
 
-**685 tests. Two backends, both complete and green: SQLite, and Dolt —
+**730 tests. Two backends, both complete and green: SQLite, and Dolt —
 **verified against real dolt 2.1.10** (100 bd-dolt tests run for real; nothing
 skips). Dolt's binary is a runtime dependency, not vendored; install it and it is
 on. See "Dolt: verified" at the bottom.**
@@ -79,17 +79,26 @@ of proto-issues out, tested against the formula files upstream ships.
 `gc`, `purge`, `prune`, `reclaim`, `admin cleanup`, `backup` (exit 2 on SQLite —
 it is a *Dolt* backup: branches, history, working set), `merge-slot`, `worktree`.
 
+**Advanced** — **`mol`** (`wisp`, `seed --var`, `pour`, `show`, `ready`,
+`current`, `stale`, `burn`, `squash`, `bond`), **`gate`** (`create`, `show`,
+`list`, `check`, `resolve`), **`swarm validate`**, **`swarm list`**, **`rules
+audit`**, `remember`/`recall`/`memories`/`forget`, `todo`, `human`. Molecules and
+gates are just issues (type `Molecule`/`Gate`); wisps set `ephemeral`. `mol
+seed`/`pour` cook a formula into a tracked container.
+
 ## Stubs — exit 64
 
 | Command | Blocked on |
 | --- | --- |
-| `mol` (11 leaves), `swarm` (4), `gate` (5), `rules` (2) | **Molecule / gate / swarm lifecycle.** These sit on the formula compiler (now done — `bd cook` and `bd formula` work) but are their own domain: a molecule is a *persistent* formula instance whose steps are tracked over time. `bd cook` already turns a formula into a live graph; `mol pour` attaches that graph to a tracked container. The next fan-out. |
-| `todo` (3), `human` (4), `remember`/`memories`/`forget`/`recall` | Nothing hard; just unbuilt. |
+| `mol distill` | Needs `--var` and an `--output` path (flagless `Distill { id }` cannot supply them) to emit a *parameterized* `.formula.toml`. A literal, un-reusable formula is the one thing distill exists not to produce. |
+| `swarm create` / `swarm status` | Ride on a `mol_type = swarm` molecule linked to an epic, and a `convoy`-type formula that `bd-formula` does not cook yet. No honest substrate. |
+| `rules compact` | It merges rule files and *deletes the sources*. The flagless `Compact` variant offers no `--dry-run`/`--group`/`--auto`, so it cannot be driven safely — refusing beats a reckless default. |
 | `restore`, `state`, `set-state`, `label propagate` | Custom-status workflow; the seam has the pieces. |
-| `flatten` | |
+| `flatten` | Graph flattening; unbuilt. |
 | `compact`, `migrate`, `rename-prefix`, `admin compact`, `admin reset` | `migrate` wants `Storage::schema_version()`, which this port has no notion of. Deliberately **not** exit 2: SQLite compacts (`VACUUM`) and SQLite has a schema, so "the backend cannot" would be a lie. |
 | `config unset` / `validate` / `show` | The seam has no config *delete*. |
 | `sql` | Raw SQL cannot go through a backend-agnostic trait, and giving it one would make every other backend a liar the moment it did not speak SQLite's dialect. **The seam has no `execute_sql`, on purpose.** |
+| `formula convert` | This port only ever spoke TOML; there is nothing to convert *from*. |
 
 ---
 
