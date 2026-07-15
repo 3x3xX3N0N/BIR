@@ -249,3 +249,18 @@ CREATE TABLE IF NOT EXISTS config (
 
     PRIMARY KEY (`key`)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
+
+-- The schema version stamp (SQLite keeps it in `PRAGMA user_version`; MySQL
+-- has no equivalent, so here it is a table). A *versioned* table on purpose:
+-- it rides along on clone, push, pull and merge, so a database migrated on one
+-- machine tells every other machine — that is the whole handshake. Not a
+-- `config` row, because `bd config set` can reach those and the stamp must not
+-- be editable by accident. One row, id = 1; an empty table means the database
+-- predates version stamping (read as v1 — the only shape that ever shipped
+-- unversioned).
+CREATE TABLE IF NOT EXISTS schema_meta (
+    id      TINYINT      NOT NULL,
+    version INT UNSIGNED NOT NULL,
+
+    PRIMARY KEY (id)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;

@@ -156,10 +156,12 @@ struct Header {
     /// what every SQLite before 3.7 wrote, so believing it would invent
     /// corruption out of an old file.
     pages: Option<u64>,
-    /// `PRAGMA user_version`. Zero in every workspace this port has ever
-    /// created, because this port has no schema version. See [`Schema`].
-    user_version: u32,
 }
+
+// `PRAGMA user_version` (bytes 60..64) is deliberately *not* read out of the
+// header here. It is the schema version stamp now, and the [`Schema`] check
+// asks the open store for it — one code path for both backends, instead of a
+// header peek that only ever worked for SQLite.
 
 #[derive(Debug)]
 enum Shape {
@@ -232,14 +234,7 @@ fn inspect(path: &Path) -> Shape {
     // the "version-valid-for" number (92..96).
     let pages = (be32(&head[24..]) == be32(&head[92..])).then(|| u64::from(be32(&head[28..])));
 
-    Shape::Sqlite(
-        Header {
-            page_size,
-            pages,
-            user_version: be32(&head[60..]),
-        },
-        len,
-    )
+    Shape::Sqlite(Header { page_size, pages }, len)
 }
 
 /// The first line of whatever this actually is, made safe to print.
@@ -495,28 +490,20 @@ impl Check for Database {
 
 /// Is this database the shape this binary expects.
 ///
-/// # There is no schema version in this port, and this check does not pretend
+/// Two determinations, both real:
 ///
-/// `bd-sqlite` applies `schema.sql` entirely in `CREATE TABLE IF NOT EXISTS` and
-/// records no version anywhere — which is exactly why `bd migrate` is a stub
-/// (exit 64). So this check cannot compare a number against a number. Two things
-/// it can do instead, and both are real:
-///
-/// 1. **Exercise the tables.** A database that opens but has no `issues` table is
-///    the single most common "schema" fault there is — an empty file, a database
-///    written by a different tool, a `.beads/` from a beads that is not this one.
-///    Asking is a positive determination, not a proxy for one.
-/// 2. **Read `user_version` out of the file header.** This port never sets it, so
-///    it is 0 in every workspace `bd init` has ever made. A *nonzero* value
-///    therefore means something that does version its schema wrote this file —
-///    and that this binary has no idea whether it can read it safely. That is a
-///    warning, and it never fires on a workspace this port created (rule 4:
-///    absence is not failure).
-///
-/// What is deliberately **not** here: a "pending migrations" check. With no
-/// version and no migration records, it could only ever return "I don't know" —
-/// on every healthy workspace, forever. A permanent warning is how you teach
-/// someone to ignore warnings.
+/// 1. **Compare the version stamp.** Every database this port creates is
+///    stamped ([`bd_storage::SCHEMA_VERSION`]; `PRAGMA user_version` on
+///    SQLite, the `schema_meta` table on Dolt). Behind means `bd migrate`;
+///    ahead means a newer bd wrote this and the fix is upgrading bd — each
+///    refusal names its own next step, never the other's. A raw stamp of 0 is
+///    a database from before stamping existed: v1 by definition, so it passes
+///    — with a one-time nudge to run `bd migrate`, because an unstamped
+///    database stops being cheap to identify the day a v2 schema ships.
+/// 2. **Exercise the tables.** A database that opens but has no `issues` table
+///    is the single most common "schema" fault there is — an empty file, a
+///    database written by a different tool. The stamp can lie (another tool
+///    can write a 1); the tables answering is a positive determination.
 struct Schema;
 
 #[async_trait]
@@ -537,14 +524,52 @@ impl Check for Schema {
             );
         };
 
+        // The stamp first: it is the cheap, precise answer, and when it
+        // mismatches, the table exercise below would just fail noisily at
+        // whatever query happens to hit the changed shape first.
+        let speaks = bd_storage::SCHEMA_VERSION;
+        let raw = match store.schema_version().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Finding::error("schema", "the schema version stamp does not answer")
+                    .detail(e.to_string())
+                    .fix(
+                        "this database is not the shape this build of bd expects — export from \
+                         whatever wrote it, then `bd import` into a fresh `bd init` workspace",
+                    );
+            }
+        };
+        let effective = bd_storage::effective_schema_version(raw);
+
+        if effective < speaks {
+            return Finding::error(
+                "schema",
+                format!("the database records schema v{effective}; this bd speaks v{speaks}"),
+            )
+            .fix("run `bd migrate` to bring the database up to date in place");
+        }
+        if effective > speaks {
+            return Finding::error(
+                "schema",
+                format!(
+                    "the database records schema v{effective}, newer than this build of bd \
+                     (v{speaks})"
+                ),
+            )
+            .detail(
+                "a newer bd wrote this database; nothing here can tell you whether this build \
+                 reads it safely",
+            )
+            .fix("upgrade bd — `bd migrate` cannot downgrade a database");
+        }
+
         let incompatible = |table: &str, e: String| {
             Finding::error("schema", format!("the `{table}` table does not answer"))
                 .detail(e)
                 .fix(
-                    "this database is not the shape this build of bd expects. `bd migrate` is not \
-                     implemented in this port (it exits 64) and there is no in-place upgrade — \
-                     export from whatever wrote this database, then `bd import` into a fresh \
-                     `bd init` workspace",
+                    "the version stamp matches but the tables do not — something other than bd \
+                     has altered this database. Export from whatever wrote it, then `bd import` \
+                     into a fresh `bd init` workspace",
                 )
         };
 
@@ -556,30 +581,23 @@ impl Check for Schema {
             Err(e) => return incompatible("issues", e.to_string()),
         };
 
-        // The tables are there. Now: did something that versions its schema
-        // write this file?
-        if let Some(Shape::Sqlite(h, _)) = db_path(dx).as_deref().map(inspect)
-            && h.user_version != 0
-        {
+        if raw == 0 {
             return Finding::warn(
                 "schema",
-                format!("the database records schema version {}", h.user_version),
+                format!("pre-versioning database (v{speaks} by definition, but unstamped)"),
             )
             .detail(format!(
-                "this build of bd does not implement schema versioning at all — it writes \
-                 user_version 0 and never reads it. A nonzero version means another tool wrote \
-                 this database, and nothing here can tell you whether it is safe to read.\n\nits \
-                 tables do answer: {count} issues.",
+                "this database predates schema version stamping. It is v{speaks} — exactly one \
+                 schema ever shipped unversioned — and everything works today; the stamp is what \
+                 lets a future bd say `run bd migrate` instead of failing mid-query.\n\nits \
+                 tables answer: {count} issues.",
             ))
-            .fix(
-                "if this workspace belongs to another beads implementation, use that one. `bd \
-                 migrate` is a stub in this port (exit 64) and cannot reconcile the two",
-            );
+            .fix("run `bd migrate` once to stamp it");
         }
 
-        Finding::ok("schema", format!("issues and config answer ({count} issues)")).detail(
-            "there is no schema version in this port, so compatibility is established by \
-             exercising the tables rather than by comparing a number",
+        Finding::ok(
+            "schema",
+            format!("schema v{effective}; issues and config answer ({count} issues)"),
         )
     }
 }
@@ -1006,7 +1024,6 @@ mod tests {
             Shape::Sqlite(h, len) => {
                 assert_eq!(h.page_size, 4096);
                 assert_eq!(h.pages, Some(1));
-                assert_eq!(h.user_version, 0);
                 assert_eq!(len, 4096);
             }
             other => panic!("a valid header did not parse: {other:?}"),

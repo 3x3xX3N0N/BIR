@@ -353,15 +353,15 @@ fn mail_delegates_and_carries_the_providers_exit_code_out() {
         return;
     }
 
-    // Delegate to bd itself: `bd migrate` is a stub, so it exits 64. Nothing
+    // Delegate to bd itself: `bd compact` is a stub, so it exits 64. Nothing
     // else in the pipeline produces a 64, which makes it proof that the code we
     // exit with is the *provider's* and not one we invented.
     //
-    // This said `gc` until `gc` was implemented -- the second test in this repo
-    // to be pinned to "gc is a stub" and broken by that ceasing to be true.
-    // `migrate` is the safer choice: it needs a schema version to migrate
-    // between, and this port does not have one.
-    let delegate = format!("{exe} -C {} migrate", tmp.to_str().unwrap());
+    // This said `gc` until `gc` was implemented, then `migrate` until *it* was
+    // implemented -- the third test in this repo to be pinned to "X is a stub"
+    // and broken by that ceasing to be true. If `compact` gets built, any
+    // still-stubbed command from PORT_STATUS.md works here.
+    let delegate = format!("{exe} -C {} compact", tmp.to_str().unwrap());
     let out = bd()
         .args(["-C", tmp.to_str().unwrap(), "mail"])
         .env("BEADS_MAIL_DELEGATE", &delegate)

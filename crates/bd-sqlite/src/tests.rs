@@ -1415,3 +1415,85 @@ async fn update_applies_only_the_fields_that_were_set() {
         Err(Error::NotFound(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Schema version
+// ---------------------------------------------------------------------------
+
+/// `bd init` stamps `PRAGMA user_version` with the current schema version, so
+/// every database this port creates is self-describing from birth. This is the
+/// insurance bought before the first schema change exists — upstream ships
+/// schema changes with no recorded version, and every upgrade there is a
+/// coordinated, manual event across machines.
+#[tokio::test]
+async fn init_stamps_the_schema_version() {
+    let (_d, s) = ws().await;
+    assert_eq!(
+        s.schema_version().await.unwrap(),
+        bd_storage::SCHEMA_VERSION,
+        "a fresh workspace must carry the version it was written at"
+    );
+}
+
+/// `migrate` on a current database is a no-op that says so; on a
+/// pre-versioning database (raw stamp 0 — what every 0.1.0 workspace looks
+/// like) it stamps and reports the transition. Both exit successfully: an
+/// agent may run it unconditionally after upgrading bd.
+#[tokio::test]
+async fn migrate_stamps_a_preversioning_database_and_is_idempotent() {
+    let (dir, s) = ws().await;
+
+    let done = s.migrate().await.unwrap();
+    assert_eq!(done.from, bd_storage::SCHEMA_VERSION, "already stamped");
+    assert_eq!(done.to, bd_storage::SCHEMA_VERSION);
+
+    // Rewind the stamp to what a database from before version stamping holds.
+    s.close().await.unwrap();
+    let beads = dir.0.join(".beads");
+    let loc = Locator::load(&beads).unwrap();
+    let pool = crate::connect(&loc.db_path()).await.unwrap();
+    sqlx::raw_sql("PRAGMA user_version = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let s = as_other(&dir, "bob").await;
+    assert_eq!(s.schema_version().await.unwrap(), 0, "raw stamp, honestly");
+
+    let done = s.migrate().await.unwrap();
+    assert_eq!((done.from, done.to), (0, bd_storage::SCHEMA_VERSION));
+    assert_eq!(s.schema_version().await.unwrap(), bd_storage::SCHEMA_VERSION);
+}
+
+/// A stamp *newer* than this build is refused — migrating downward is data
+/// loss wearing a maintenance command's name, and the error says what the real
+/// fix is (upgrading bd).
+#[tokio::test]
+async fn migrate_refuses_to_downgrade() {
+    let (dir, s) = ws().await;
+    s.close().await.unwrap();
+
+    let beads = dir.0.join(".beads");
+    let loc = Locator::load(&beads).unwrap();
+    let pool = crate::connect(&loc.db_path()).await.unwrap();
+    sqlx::raw_sql("PRAGMA user_version = 99")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let s = as_other(&dir, "bob").await;
+    assert_eq!(s.schema_version().await.unwrap(), 99);
+    let err = s.migrate().await.unwrap_err().to_string();
+    assert!(err.contains("newer"), "the refusal explains itself: {err}");
+    assert!(
+        err.contains("Upgrade bd"),
+        "the refusal points at the real fix: {err}"
+    );
+    assert_eq!(
+        s.schema_version().await.unwrap(),
+        99,
+        "a refused migrate must not have touched the stamp"
+    );
+}

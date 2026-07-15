@@ -120,6 +120,17 @@ pub async fn init(dir: &Path, prefix: &str, identity: Identity) -> Result<Box<dy
 
     let store = open_at(dir, identity).await?;
     store.set_config(PREFIX_KEY, prefix).await?;
+
+    // Stamp the schema version, but never overwrite one: `INSERT IGNORE`
+    // seeds a fresh database and leaves a re-`init` over an existing one
+    // exactly as stamped as it was — if that stamp is behind this build, the
+    // version gate will say so and `bd migrate` is the honest path up.
+    sqlx::query("INSERT IGNORE INTO schema_meta (id, version) VALUES (1, ?)")
+        .bind(bd_storage::SCHEMA_VERSION)
+        .execute(store.pool())
+        .await
+        .map_err(|e| other(format!("could not stamp the schema version: {e}")))?;
+
     Ok(Box::new(store))
 }
 

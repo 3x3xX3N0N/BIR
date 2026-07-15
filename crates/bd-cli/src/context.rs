@@ -165,7 +165,32 @@ impl Ctx {
     /// it reads the backend from the locator — never from a flag or the
     /// environment (seam rule 3). Everything above gets a `&dyn Storage` and
     /// never learns what it got.
+    ///
+    /// # The version gate
+    ///
+    /// Opening also checks the database's schema version stamp against
+    /// [`bd_storage::SCHEMA_VERSION`], and a mismatch is a refusal with the
+    /// exact next step in it — `bd migrate` when the database is behind,
+    /// "upgrade bd" when it is ahead. The alternative is what upstream users
+    /// live with: a version-skewed database limps into raw SQL errors three
+    /// queries in, or worse, into answers that are quietly wrong. One extra
+    /// read per process is what that costs.
+    ///
+    /// Two commands step around the gate via [`Ctx::store_unchecked`]:
+    /// `migrate`, which exists to fix exactly what the gate refuses, and
+    /// `doctor`, whose job is to examine databases other commands refuse.
     pub async fn store(&self) -> Result<&dyn Storage> {
+        self.store_inner(true).await
+    }
+
+    /// [`Ctx::store`] without the version gate. For `migrate` and `doctor`
+    /// only — anything else that reaches for this is opting into undefined
+    /// queries against a shape this build has never seen.
+    pub async fn store_unchecked(&self) -> Result<&dyn Storage> {
+        self.store_inner(false).await
+    }
+
+    async fn store_inner(&self, gate: bool) -> Result<&dyn Storage> {
         let store = self
             .store
             .get_or_try_init(|| async {
@@ -178,7 +203,11 @@ impl Ctx {
                     l.backend,
                     l.dir.display()
                 ));
-                open_store(l, self.identity.clone()).await
+                let store = open_store(l, self.identity.clone()).await?;
+                if gate {
+                    ensure_schema_current(store.as_ref()).await?;
+                }
+                Ok::<_, anyhow::Error>(store)
             })
             .await?;
         Ok(store.as_ref())
@@ -246,6 +275,30 @@ impl Ctx {
         if let Some(s) = self.store.into_inner() {
             let _ = s.close().await;
         }
+    }
+}
+
+/// The version handshake: refuse, precisely, a database whose schema stamp
+/// does not match this build.
+///
+/// A raw stamp of 0 (a database from before this port stamped versions) reads
+/// as v1 — the one shape that ever shipped unversioned — so existing
+/// workspaces pass with no ceremony. See [`bd_storage::effective_schema_version`].
+async fn ensure_schema_current(store: &dyn Storage) -> Result<()> {
+    let raw = store.schema_version().await?;
+    let v = bd_storage::effective_schema_version(raw);
+    let speaks = bd_storage::SCHEMA_VERSION;
+    match v.cmp(&speaks) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => bail!(
+            "this workspace's database records schema v{v}; this build of bd speaks v{speaks}.\n\
+             Run `bd migrate` to bring the database up to date in place."
+        ),
+        std::cmp::Ordering::Greater => bail!(
+            "this workspace's database records schema v{v}, but this build of bd speaks \
+             v{speaks} — the database was written by a newer bd.\n\
+             Upgrade bd; `bd migrate` cannot downgrade a database."
+        ),
     }
 }
 

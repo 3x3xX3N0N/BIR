@@ -3,20 +3,21 @@
 //!
 //! # Three answers, and they are not interchangeable
 //!
-//! * **Done.** `preflight`, `reclaim`, `gc`, `prune`, `purge`, `admin cleanup`.
+//! * **Done.** `preflight`, `reclaim`, `gc`, `prune`, `purge`, `migrate`,
+//!   `admin cleanup`.
 //! * **Exit 2 — a real "no".** `backup`, and only `backup`. Upstream's backup is
 //!   a *Dolt* backup: `backup init <path>` registers a backup remote, `backup
 //!   sync` pushes to it, and what it preserves is the database — branches,
 //!   commit history, working set. That is [`Cap::Remote`], so a store with no
 //!   commit graph is not missing a feature, it is being asked the wrong question.
-//! * **Exit 64 — not built.** `compact`, `migrate`, `rename-prefix`, `worktree`,
+//! * **Exit 64 — not built.** `compact`, `rename-prefix`, `worktree`,
 //!   `merge-slot`, `admin reset`.
 //!
-//! `compact` and `migrate` are deliberately **not** exit 2, tempting as it looks.
-//! SQLite compacts (`VACUUM`) and SQLite has a schema. Neither is a commit-graph
-//! feature, so "the sqlite backend cannot do that" would be a lie — and exit 2 is
-//! supposed to be a *true, final* answer that nobody ever revisits. What they are
-//! missing is a seam method; see each one's doc comment for the signature.
+//! `compact` is deliberately **not** exit 2, tempting as it looks. SQLite
+//! compacts (`VACUUM`); it is not a commit-graph feature, so "the sqlite backend
+//! cannot do that" would be a lie — and exit 2 is supposed to be a *true, final*
+//! answer that nobody ever revisits. What it is missing is a seam method
+//! (`Storage::compact`); see its doc comment.
 //!
 //! # Previewing, and consenting
 //!
@@ -658,17 +659,49 @@ pub async fn compact(ctx: &Ctx) -> Result<()> {
     stub("compact", ctx)
 }
 
-/// Also not exit 2, and for a sharper reason: there is no schema *version*
-/// anywhere in this port. bd-sqlite applies `schema.sql` once, entirely in
-/// `CREATE TABLE IF NOT EXISTS`, and records no version anywhere — so `migrate`
-/// has nothing to compare the database against. That is a gap in the port, not a
-/// limit of the backend.
+/// Bring the database's schema to the version this build speaks.
 ///
-/// Needs, in order: a recorded schema version (`Storage::schema_version(&self) ->
-/// Result<u32>`), then `Storage::migrate(&self) -> Result<u32>` returning the
-/// version it arrived at.
+/// Opens **unchecked** — the version gate in [`Ctx::store`] refuses exactly
+/// the databases this command exists to fix, so `migrate` is one of the two
+/// commands (with `doctor`) that step around it.
+///
+/// Three honest outcomes:
+/// * already current — exit 0, changed nothing, says so;
+/// * behind (including the raw-0 stamp of a pre-versioning database) — runs
+///   the ladder in [`Storage::migrate`] and stamps, reporting from → to;
+/// * **ahead** — refuses. A newer bd wrote this database, and migrating
+///   downward is data loss wearing a maintenance command's name; the fix is
+///   upgrading bd, and the error says so.
 pub async fn migrate(ctx: &Ctx) -> Result<()> {
-    stub("migrate", ctx)
+    ctx.ensure_writable("migrate")?;
+    let store = ctx.store_unchecked().await?;
+    let outcome = store.migrate().await?;
+    let changed = outcome.from != outcome.to;
+
+    if ctx.out.is_json() {
+        return ctx.out.json_value(&json!({
+            "command": "migrate",
+            "from": outcome.from,
+            "to": outcome.to,
+            "changed": changed,
+        }));
+    }
+
+    if !changed {
+        ctx.out
+            .line(format!("schema is v{} — already current", outcome.to));
+    } else if outcome.from == 0 {
+        ctx.out.line(format!(
+            "stamped a pre-versioning database as schema v{}",
+            outcome.to
+        ));
+    } else {
+        ctx.out.line(format!(
+            "migrated schema v{} -> v{}",
+            outcome.from, outcome.to
+        ));
+    }
+    Ok(())
 }
 
 /// Rewriting every id in the workspace.

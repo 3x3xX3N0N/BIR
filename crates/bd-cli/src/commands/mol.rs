@@ -233,8 +233,20 @@ async fn pour(ctx: &Ctx, id: &str) -> Result<()> {
         .and_then(|m| m.get(MOL_META_KEY))
         .ok_or_else(|| anyhow!("{id} is not a seeded molecule (use `bd mol seed`)"))?;
 
-    if meta.get("poured").and_then(Value::as_bool).unwrap_or(false) {
-        bail!("{id} has already been poured; its steps exist (see `bd mol show {id}`)");
+    // Fail closed on the marker. "Could not tell whether this was poured" must
+    // not read as "not poured" — pouring twice materializes every step twice,
+    // which is precisely the duplicate-work churn this flag exists to prevent.
+    // Only a bool this code never wrote can be here, so a non-bool is
+    // corruption, and corruption gets a refusal, not a coin flip.
+    match meta.get("poured") {
+        Some(Value::Bool(true)) => {
+            bail!("{id} has already been poured; its steps exist (see `bd mol show {id}`)")
+        }
+        Some(Value::Bool(false)) | None => {}
+        Some(other) => bail!(
+            "{id} has a corrupt 'poured' marker ({other}); refusing to pour rather than \
+             risk materializing every step twice"
+        ),
     }
     let source = meta
         .get("source")

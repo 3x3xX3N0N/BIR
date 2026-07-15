@@ -494,12 +494,11 @@ fn a_workspace_without_an_export_is_not_a_fresh_clone() {
 // Schema
 // ---------------------------------------------------------------------------
 
-/// This port has no schema version: it writes `user_version` 0 and never reads
-/// it. So a *nonzero* one means something else wrote this database — and that
-/// this binary cannot know whether it is safe to read. That is a warning, and it
-/// must never claim a fix that does not exist: `bd migrate` is a stub here.
+/// A schema version *ahead* of this build means a newer bd wrote the database.
+/// The doctor must say so as an error whose fix is "upgrade bd" — and must not
+/// suggest `bd migrate`, which refuses to downgrade (and says that too).
 #[test]
-fn a_schema_version_this_build_does_not_know_is_a_warning_that_promises_nothing() {
+fn a_schema_version_from_a_newer_bd_is_an_error_whose_fix_is_upgrading_bd() {
     let ws = Ws::new("version");
     ws.remove_db_sidecars_after_checkpoint();
 
@@ -508,22 +507,97 @@ fn a_schema_version_this_build_does_not_know_is_a_warning_that_promises_nothing(
     bytes[60..64].copy_from_slice(&7u32.to_be_bytes());
     std::fs::write(ws.db(), &bytes).unwrap();
 
+    // Ordinary commands refuse at the door — the version gate, not a SQL error.
+    let out = bd()
+        .current_dir(&ws.0)
+        .args(["list"])
+        .output()
+        .expect("run bd");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("v7") && err.contains("Upgrade bd"),
+        "the refusal must name the version and the fix: {err}"
+    );
+
+    // The doctor still examines what other commands refuse — that is its job.
     let (r, code) = ws.doctor(&[]);
-    assert_eq!(code, 0, "an unknown schema version is a warning, not a failure");
-    assert_eq!(r.status("schema"), "warning");
+    assert_eq!(code, 1, "a database this build cannot read is a failure");
+    assert_eq!(r.status("schema"), "error");
 
     let said = r.text("schema");
     assert!(said.contains('7'), "the version itself is the evidence: {said}");
-    // `bd migrate` exits 64. Telling someone to run it would be a fix that does
-    // not work, which is worse than no fix at all.
+    assert!(
+        said.contains("upgrade bd"),
+        "the fix is upgrading bd, and the report must say so: {said}"
+    );
     assert!(
         !said.contains("run `bd migrate`") && !said.contains("run 'bd migrate'"),
-        "the report offered a command that is not implemented: {said}"
+        "migrate cannot downgrade, so offering it here is a fix that does not work: {said}"
     );
+
+    // And migrate itself refuses the downgrade, with the real fix in the error.
+    let out = bd()
+        .current_dir(&ws.0)
+        .args(["migrate"])
+        .output()
+        .expect("run bd");
     assert_eq!(
-        ws.run(&["migrate"]).1,
-        64,
-        "if `bd migrate` has been implemented, the schema check's advice needs revisiting"
+        out.status.code(),
+        Some(1),
+        "migrating downward is refused, not attempted"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Upgrade bd"),
+        "the refusal must point at the real fix"
+    );
+}
+
+/// A database from before version stamping (raw 0) is v1 by definition — it
+/// works today with no ceremony, and the doctor's only note is a one-time
+/// warning to stamp it, with the exact command. Running that command makes the
+/// warning go away. This is the upgrade story upstream never had: no chosen
+/// master, no re-bootstrap, no coordination.
+#[test]
+fn a_preversioning_database_works_and_migrate_stamps_it() {
+    let ws = Ws::new("unstamped");
+    ws.remove_db_sidecars_after_checkpoint();
+
+    // Zero the stamp: what every database created by bd 0.1.0 looks like.
+    let mut bytes = std::fs::read(ws.db()).unwrap();
+    bytes[60..64].copy_from_slice(&0u32.to_be_bytes());
+    std::fs::write(ws.db(), &bytes).unwrap();
+
+    // Unstamped is NOT broken: every command works (0 reads as v1).
+    assert_eq!(ws.run(&["list"]).1, 0, "a pre-versioning database must work");
+
+    let (r, code) = ws.doctor(&[]);
+    assert_eq!(code, 0, "unstamped is a warning, never a failure");
+    assert_eq!(r.status("schema"), "warning");
+    assert!(
+        r.text("schema").contains("bd migrate"),
+        "the warning must carry its one-command fix: {}",
+        r.text("schema")
+    );
+
+    let (out, code) = ws.run(&["migrate"]);
+    assert_eq!(code, 0, "stamping must succeed: {out}");
+
+    let (r, _) = ws.doctor(&[]);
+    assert_eq!(
+        r.status("schema"),
+        "ok",
+        "after the stamp the warning is gone: {}",
+        r.text("schema")
+    );
+
+    // The stamp is really in the file header, not just in the report.
+    ws.remove_db_sidecars_after_checkpoint();
+    let bytes = std::fs::read(ws.db()).unwrap();
+    assert_eq!(
+        u32::from_be_bytes(bytes[60..64].try_into().unwrap()),
+        1,
+        "user_version must hold the stamped schema version"
     );
 }
 

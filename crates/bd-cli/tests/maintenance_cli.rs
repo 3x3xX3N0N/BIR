@@ -5,9 +5,10 @@
 //! * The sweeps do what they say — and, more importantly, *stop* where they say.
 //!   A garbage collector is only trustworthy in terms of what it leaves alone.
 //! * The exit-code classification. `backup` is exit 2 forever (sqlite has no
-//!   commit graph to back up); `compact` and `migrate` are exit 64 until somebody
-//!   builds them. If those two ever swap, the port's status becomes unreadable —
-//!   so they are asserted, not documented.
+//!   commit graph to back up); `compact` is exit 64 until somebody builds it.
+//!   If those two ever swap, the port's status becomes unreadable — so they are
+//!   asserted, not documented. (`migrate` graduated from that list: it is real
+//!   now, and has its own tests below.)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -391,12 +392,42 @@ fn backup_is_a_real_no_and_compact_is_an_unfinished_yes() {
     assert_eq!(doc["error"], "unsupported_backend");
     assert_eq!(doc["requires"], "dolt");
 
-    // Compaction and schema migration are things SQLite can absolutely do
-    // (`VACUUM`; a schema version). The seam just does not expose them yet. Exit
-    // 2 here would tell a user to stop waiting for something that is coming.
-    for cmd in ["compact", "migrate"] {
-        let (doc, code) = ws.json(&["--json", cmd]);
-        assert_eq!(code, 64, "`bd {cmd}` is unbuilt, not impossible");
-        assert_eq!(doc["error"], "not_implemented");
-    }
+    // Compaction is something SQLite can absolutely do (`VACUUM`). The seam
+    // just does not expose it yet. Exit 2 here would tell a user to stop
+    // waiting for something that is coming.
+    let (doc, code) = ws.json(&["--json", "compact"]);
+    assert_eq!(code, 64, "`bd compact` is unbuilt, not impossible");
+    assert_eq!(doc["error"], "not_implemented");
+}
+
+// ---------------------------------------------------------------------------
+// migrate — the schema version stamp
+// ---------------------------------------------------------------------------
+
+/// On a freshly initialized workspace `bd migrate` has nothing to do and says
+/// so: `bd init` already stamped the current schema version. Idempotent, exit
+/// 0 both times — an agent can run it unconditionally after upgrading bd.
+#[test]
+fn migrate_on_a_current_workspace_changes_nothing_and_says_so() {
+    let ws = Ws::new("migrate-current");
+
+    let (doc, code) = ws.json(&["--json", "migrate"]);
+    assert_eq!(code, 0, "already-current is a success, not an error: {doc}");
+    assert_eq!(doc["command"], "migrate");
+    assert_eq!(doc["changed"], false);
+    assert_eq!(doc["from"], doc["to"], "nothing moved");
+
+    // And again: migrate twice is exactly as fine as migrate once.
+    let (doc, code) = ws.json(&["--json", "migrate"]);
+    assert_eq!(code, 0);
+    assert_eq!(doc["changed"], false);
+}
+
+/// `--readonly` refuses `migrate` before it touches anything. The stamp is a
+/// write, and "the caller said no writes" beats "but it is a small one".
+#[test]
+fn readonly_refuses_migrate() {
+    let ws = Ws::new("migrate-ro");
+    let (_, code) = ws.run(&["--readonly", "migrate"]);
+    assert_ne!(code, 0, "--readonly must refuse a write");
 }

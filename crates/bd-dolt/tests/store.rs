@@ -745,3 +745,60 @@ async fn the_dolt_store_advertises_a_commit_graph() {
     assert!(store.has_commit_graph());
     assert_eq!(store.backend(), bd_storage::Backend::Dolt);
 }
+
+// ---------------------------------------------------------------------------
+// Schema version
+// ---------------------------------------------------------------------------
+
+/// The stamp lives in the `schema_meta` table — versioned data, so it rides
+/// along on clone/push/pull and a database migrated on one machine announces
+/// it to every clone at the next sync. This fixture connects without going
+/// through `bd_dolt::init`, so it starts exactly like a pre-versioning
+/// database: table present (the schema applies on open), no row (raw 0).
+#[tokio::test]
+async fn schema_version_starts_unstamped_and_migrate_stamps_it() {
+    let f = fixture!("schemaver");
+
+    assert_eq!(
+        f.schema_version().await.unwrap(),
+        0,
+        "no stamp row yet: this is what a pre-versioning database reads as"
+    );
+
+    let done = f.migrate().await.unwrap();
+    assert_eq!((done.from, done.to), (0, bd_storage::SCHEMA_VERSION));
+    assert_eq!(
+        f.schema_version().await.unwrap(),
+        bd_storage::SCHEMA_VERSION
+    );
+
+    // Idempotent: migrate twice is exactly as fine as migrate once.
+    let again = f.migrate().await.unwrap();
+    assert_eq!(again.from, bd_storage::SCHEMA_VERSION);
+    assert_eq!(again.to, bd_storage::SCHEMA_VERSION);
+}
+
+/// A stamp newer than this build is refused, with the real fix (upgrade bd) in
+/// the error — and the stamp is left exactly as it was found.
+#[tokio::test]
+async fn schema_version_from_the_future_is_refused() {
+    let f = fixture!("schemafuture");
+
+    sqlx::query("INSERT INTO schema_meta (id, version) VALUES (1, 99)")
+        .execute(f.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(f.schema_version().await.unwrap(), 99);
+    let err = f.migrate().await.unwrap_err().to_string();
+    assert!(err.contains("newer"), "the refusal explains itself: {err}");
+    assert!(
+        err.contains("Upgrade bd"),
+        "the refusal points at the real fix: {err}"
+    );
+    assert_eq!(
+        f.schema_version().await.unwrap(),
+        99,
+        "a refused migrate must not have touched the stamp"
+    );
+}

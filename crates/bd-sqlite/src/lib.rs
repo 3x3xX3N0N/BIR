@@ -50,6 +50,19 @@ pub async fn init(dir: &Path, prefix: &str, identity: Identity) -> Result<Box<dy
     let pool = connect(&locator.db_path()).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await.map_err(db)?;
 
+    // Stamp the schema version into the file header (`PRAGMA user_version`),
+    // so every database this port creates is self-describing from birth. The
+    // pragma rather than a config row on purpose: `bd config set` cannot
+    // reach it, so nobody can "clean it up". Idempotent-safe on re-init: the
+    // stamp is only ever the version the schema above just (re)applied.
+    sqlx::raw_sql(&format!(
+        "PRAGMA user_version = {}",
+        bd_storage::SCHEMA_VERSION
+    ))
+    .execute(&pool)
+    .await
+    .map_err(db)?;
+
     sqlx::query(
         "INSERT INTO config (key, value) VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

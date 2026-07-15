@@ -48,6 +48,27 @@ impl SqliteStore {
         }
     }
 
+    /// A write transaction: `BEGIN IMMEDIATE`, never sqlx's default deferred
+    /// `BEGIN`.
+    ///
+    /// Deferred is a trap under multi-process load — the ultraphrenia case
+    /// this store exists for. Every write path here opens with a SELECT, so a
+    /// deferred transaction takes a *read* snapshot first; when it then
+    /// writes, SQLite must upgrade the lock, and if any other process
+    /// committed in between, the upgrade fails **instantly** with
+    /// `SQLITE_BUSY_SNAPSHOT`. `busy_timeout` never applies — waiting cannot
+    /// help a stale snapshot — so six concurrent agents produced "database is
+    /// locked" in under a second of contention, ten-second timeout
+    /// notwithstanding. `BEGIN IMMEDIATE` takes the write lock at `BEGIN`,
+    /// where `busy_timeout` *does* apply, and writers queue politely instead.
+    ///
+    /// Found by the cross-process contention test (`contention_cli.rs`), not
+    /// by reasoning; the pool comment in `lib.rs` had even named the failure
+    /// mode. Do not "simplify" any write path back to `pool.begin()`.
+    async fn write_tx(&self) -> Result<sqlx::Transaction<'static, Sqlite>> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)
+    }
+
     /// The next event timestamp: at least `at`, and always strictly greater than
     /// any timestamp this store has handed out before.
     fn next_event_time(&self, at: DateTime<Utc>) -> DateTime<Utc> {
@@ -89,7 +110,7 @@ impl Storage for SqliteStore {
     async fn create_issue(&self, issue: &Issue) -> Result<Issue> {
         issue.validate()?;
 
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let mut row = issue.clone();
@@ -164,7 +185,7 @@ impl Storage for SqliteStore {
     }
 
     async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let old = fetch_issue(&mut tx, id)
@@ -335,7 +356,7 @@ impl Storage for SqliteStore {
     }
 
     async fn delete_issue(&self, id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let existing = fetch_issue(&mut tx, id)
@@ -390,7 +411,7 @@ impl Storage for SqliteStore {
     }
 
     async fn close_issue(&self, id: &str, reason: &str) -> Result<Issue> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let old = fetch_issue(&mut tx, id)
@@ -444,7 +465,7 @@ impl Storage for SqliteStore {
     }
 
     async fn reopen_issue(&self, id: &str) -> Result<Issue> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let old = fetch_issue(&mut tx, id)
@@ -521,7 +542,7 @@ impl Storage for SqliteStore {
     /// With a single `assignee` column the claim is then advisory — the column
     /// records the most recent claimant, and nothing is fenced.
     async fn claim_issue(&self, id: &str, lease: Duration) -> Result<Claim> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
         let expires = now + lease;
 
@@ -639,7 +660,7 @@ impl Storage for SqliteStore {
     }
 
     async fn release_claim(&self, id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let existing = fetch_issue(&mut tx, id)
@@ -681,7 +702,7 @@ impl Storage for SqliteStore {
 
     /// An agent that died mid-task must not hold its work hostage.
     async fn expire_claims(&self) -> Result<Vec<String>> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         let freed: Vec<String> = sqlx::query_scalar(
@@ -731,7 +752,7 @@ impl Storage for SqliteStore {
             )));
         }
 
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         for id in [&dep.issue_id, &dep.depends_on_id] {
@@ -794,7 +815,7 @@ impl Storage for SqliteStore {
         depends_on_id: &str,
         dep_type: &DependencyType,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         // Seeded before the delete, and seeded from *both* ends: dropping a
@@ -910,7 +931,7 @@ impl Storage for SqliteStore {
     // -- labels --------------------------------------------------------------
 
     async fn add_label(&self, issue_id: &str, label: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         if fetch_issue(&mut tx, issue_id).await?.is_none() {
             return Err(Error::NotFound(issue_id.to_string()));
         }
@@ -936,7 +957,7 @@ impl Storage for SqliteStore {
     }
 
     async fn remove_label(&self, issue_id: &str, label: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let removed = sqlx::query("DELETE FROM labels WHERE issue_id = ? AND label = ?")
             .bind(issue_id)
             .bind(label)
@@ -1017,7 +1038,7 @@ impl Storage for SqliteStore {
     /// `schema.sql`), so a collision between two workspaces is not a thing that
     /// happens rather than a thing that is caught.
     async fn upsert_comment(&self, comment: &Comment) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
 
         if fetch_issue(&mut tx, &comment.issue_id).await?.is_none() {
             return Err(Error::NotFound(comment.issue_id.clone()));
@@ -1046,7 +1067,7 @@ impl Storage for SqliteStore {
     }
 
     async fn add_comment(&self, issue_id: &str, text: &str) -> Result<Comment> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let now = Utc::now();
 
         if fetch_issue(&mut tx, issue_id).await?.is_none() {
@@ -1142,7 +1163,7 @@ impl Storage for SqliteStore {
     }
 
     async fn recompute_blocked(&self) -> Result<u64> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.write_tx().await?;
         let changed = blocked::recompute_all(&mut tx).await?;
         tx.commit().await.map_err(db)?;
         Ok(changed)
@@ -1228,6 +1249,50 @@ impl Storage for SqliteStore {
                 .insert(r.get::<String, _>("issue_type"), r.get::<i64, _>("n") as u64);
         }
         Ok(s)
+    }
+
+    // -- schema version --------------------------------------------------------
+
+    /// Raw `PRAGMA user_version` from the file header. `0` on a database made
+    /// by a build older than version stamping; `bd init` writes the current
+    /// version, so freshly made workspaces never read 0.
+    async fn schema_version(&self) -> Result<u32> {
+        let v: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(v as u32)
+    }
+
+    async fn migrate(&self) -> Result<bd_storage::MigrateOutcome> {
+        let from = Storage::schema_version(self).await?;
+        let effective = bd_storage::effective_schema_version(from);
+        if effective > bd_storage::SCHEMA_VERSION {
+            return Err(Error::Db(format!(
+                "this database records schema v{effective}, newer than this build of bd \
+                 (v{}); migrating would be a downgrade. Upgrade bd instead.",
+                bd_storage::SCHEMA_VERSION
+            )));
+        }
+
+        // The migration ladder runs here when a v2 schema ever ships: one step
+        // per version, each inside a transaction, stamping as it lands. Today
+        // effective == SCHEMA_VERSION == 1 always, so the only possible work
+        // is stamping a pre-versioning database.
+        if from != bd_storage::SCHEMA_VERSION {
+            sqlx::raw_sql(&format!(
+                "PRAGMA user_version = {}",
+                bd_storage::SCHEMA_VERSION
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        }
+
+        Ok(bd_storage::MigrateOutcome {
+            from,
+            to: bd_storage::SCHEMA_VERSION,
+        })
     }
 
     async fn close(&self) -> Result<()> {

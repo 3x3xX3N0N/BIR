@@ -84,6 +84,18 @@ agent, in any workspace, can install and drive `bd` on its own.
   `branch` / `merge` / `push` / `pull` over an issue database). The Dolt backend
   is tested against a live `dolt sql-server`.
 - **`bd doctor`** — 48 diagnostic checks across 9 families, with `--fix`.
+- **A schema version stamp in every database, and a real `bd migrate`.** Opening
+  a database from a different bd is a precise refusal that names the fix ("run
+  `bd migrate`" / "upgrade bd"), never a raw SQL error — the upgrade pain
+  upstream users live with, engineered out before this port's first schema
+  change exists. On Dolt the stamp is versioned data, so it travels with
+  clone/push/pull.
+- **Safe under concurrent agents, and tested that way.** Every SQLite write
+  transaction takes the write lock up front (`BEGIN IMMEDIATE`), so concurrent
+  sessions queue politely instead of dying with "database is locked" — proven
+  by a stress test that races real `bd` processes through the claim loop.
+  Dolt remote calls run under a deadline (`BEADS_REMOTE_TIMEOUT`, default
+  600s) instead of hanging silently for hours.
 - **`bd cook`** — a formula DSL (`bd-formula`): compile a `.formula.toml`
   (variables, conditions, loops, gates) into a live issue graph.
 - **Six tracker integrations** (github, gitlab, jira, linear, notion, ado),
@@ -91,7 +103,7 @@ agent, in any workspace, can install and drive `bd` on its own.
 - **Molecules, gates, wisps, agent memory** — the advanced tier, built on the
   same graph.
 
-734 tests; the SQLite suite runs anywhere, and the Dolt suite runs for real when
+743 tests; the SQLite suite runs anywhere, and the Dolt suite runs for real when
 a `dolt` binary is present.
 
 ## Design

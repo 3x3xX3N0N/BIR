@@ -1441,6 +1441,56 @@ impl Storage for DoltStore {
         Ok(s)
     }
 
+    // -- schema version --------------------------------------------------------
+
+    /// The stamp in `schema_meta`, raw: an empty table reads `0`, meaning the
+    /// database predates version stamping (`bd init` seeds the row, so fresh
+    /// workspaces never read 0). The table is versioned data, so the stamp
+    /// rides along on clone/push/pull — a database migrated on one machine
+    /// announces it to every clone at the next sync.
+    async fn schema_version(&self) -> Result<u32> {
+        let v: Option<u32> = sqlx::query_scalar("SELECT version FROM schema_meta WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(v.unwrap_or(0))
+    }
+
+    /// Like every other write on this backend, the stamp lands in the working
+    /// set and is captured by the next `bd dolt commit` — migrate does not
+    /// mint a commit of its own, because `DOLT_COMMIT -A` would sweep whatever
+    /// else is sitting uncommitted into a commit labeled "migrate".
+    async fn migrate(&self) -> Result<bd_storage::MigrateOutcome> {
+        let from = Storage::schema_version(self).await?;
+        let effective = bd_storage::effective_schema_version(from);
+        if effective > bd_storage::SCHEMA_VERSION {
+            return Err(Error::Db(format!(
+                "this database records schema v{effective}, newer than this build of bd \
+                 (v{}); migrating would be a downgrade. Upgrade bd instead.",
+                bd_storage::SCHEMA_VERSION
+            )));
+        }
+
+        // The migration ladder runs here when a v2 schema ever ships. Today
+        // the only possible work is stamping a pre-versioning database.
+        if from != bd_storage::SCHEMA_VERSION {
+            sqlx::query(
+                "INSERT INTO schema_meta (id, version) VALUES (1, ?)
+                 ON DUPLICATE KEY UPDATE version = ?",
+            )
+            .bind(bd_storage::SCHEMA_VERSION)
+            .bind(bd_storage::SCHEMA_VERSION)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        }
+
+        Ok(bd_storage::MigrateOutcome {
+            from,
+            to: bd_storage::SCHEMA_VERSION,
+        })
+    }
+
     async fn close(&self) -> Result<()> {
         self.pool.close().await;
         Ok(())
@@ -2840,9 +2890,10 @@ mod tests {
     #[test]
     fn the_schema_splits_into_one_statement_per_table() {
         let stmts = schema_statements(crate::SCHEMA);
+        // issues, dependencies, labels, comments, events, config, schema_meta.
         assert_eq!(
             stmts.len(),
-            6,
+            7,
             "expected one CREATE TABLE per table, got:\n{stmts:#?}"
         );
         for s in &stmts {

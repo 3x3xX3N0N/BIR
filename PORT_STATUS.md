@@ -95,7 +95,7 @@ seed`/`pour` cook a formula into a tracked container.
 | `rules compact` | It merges rule files and *deletes the sources*. The flagless `Compact` variant offers no `--dry-run`/`--group`/`--auto`, so it cannot be driven safely — refusing beats a reckless default. |
 | `restore` | Needs a *soft* delete; this port's `delete` is a hard cascade, so there is nothing to restore. |
 | `flatten` | Graph flattening; unbuilt. |
-| `compact`, `migrate`, `rename-prefix`, `admin compact`, `admin reset` | `migrate` wants `Storage::schema_version()`, which this port has no notion of. Deliberately **not** exit 2: SQLite compacts (`VACUUM`) and SQLite has a schema, so "the backend cannot" would be a lie. |
+| `compact`, `rename-prefix`, `admin compact`, `admin reset` | `compact` wants `Storage::compact()`. Deliberately **not** exit 2: SQLite compacts (`VACUUM`), so "the backend cannot" would be a lie. (`migrate` graduated: `Storage::schema_version()`/`migrate()` exist now, every database carries a version stamp, and a mismatched stamp is refused at open with the fix named — see "Known gaps and decisions".) |
 | `config unset` / `validate` / `show` | The seam has no config *delete*. |
 | `sql` | Raw SQL cannot go through a backend-agnostic trait, and giving it one would make every other backend a liar the moment it did not speak SQLite's dialect. **The seam has no `execute_sql`, on purpose.** |
 | `formula convert` | This port only ever spoke TOML; there is nothing to convert *from*. |
@@ -171,6 +171,37 @@ Things a future maintainer would otherwise rediscover the hard way.
     workspace, and `Backend::has_commit_graph()` answers the question. Opening a
     database for a command that will refuse anyway turns a clean exit 2 into a
     spurious exit 1.
+
+11. **Every database carries a schema version stamp, checked at open.**
+    `bd_storage::SCHEMA_VERSION` (currently 1) is stamped by `bd init` — SQLite's
+    `PRAGMA user_version`, Dolt's `schema_meta` table (a *versioned* table, so
+    the stamp rides along on clone/push/pull and a migration on one machine
+    announces itself to every clone). `Ctx::store()` refuses a mismatch with the
+    fix named: behind → "run `bd migrate`", ahead → "upgrade bd". A raw stamp of
+    0 is a pre-versioning database and reads as v1 (exactly one schema ever
+    shipped unversioned), so 0.1.0 workspaces keep working with no ceremony —
+    the doctor nags once to stamp. `migrate` and `doctor` open **unchecked**
+    (`Ctx::store_unchecked`): one exists to fix what the gate refuses, the other
+    to examine it. This was built *before* the first schema change on purpose —
+    upstream ships schema changes with no recorded version, and every upgrade
+    there is a manual, coordinated event (pick a master, migrate, everyone else
+    re-bootstraps; version skew between machines corrupts sync).
+
+12. **Every SQLite write transaction is `BEGIN IMMEDIATE`** (`write_tx()` in
+    `bd-sqlite/src/store.rs`). sqlx's default deferred `BEGIN` takes a read
+    snapshot at the opening SELECT; the later lock upgrade fails **instantly**
+    with `SQLITE_BUSY_SNAPSHOT` when any other process committed in between —
+    `busy_timeout` does not apply to it, and six concurrent agents produced
+    "database is locked" in under a second. Found by the cross-process
+    contention test (`contention_cli.rs`, which runs the README's claim loop at
+    maximal collision), not by reasoning. Do not "simplify" a write path back
+    to `pool.begin()`.
+
+13. **Dolt remote operations run under a deadline.** `BEADS_REMOTE_TIMEOUT`
+    seconds (default 600, `0` disables); on expiry, an honest error that names
+    the setting. Upstream users report multi-hour `dolt fetch` calls with zero
+    feedback — a bounded wait that says *why* beats unbounded silence. A
+    malformed value is an error, not a silent fallback to the default.
 
 ---
 

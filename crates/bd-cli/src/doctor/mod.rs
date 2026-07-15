@@ -402,8 +402,14 @@ impl<'a> Dx<'a> {
                 .await;
             return None;
         }
+        // Unchecked: the version gate in `Ctx::store` refuses mismatched
+        // databases, and examining what other commands refuse is the doctor's
+        // whole job. The `schema` check reports the mismatch precisely; the
+        // other checks run their queries and report what they see.
         self.probe
-            .get_or_init(|| async { self.ctx.store().await.err().map(|e| format!("{e:#}")) })
+            .get_or_init(|| async {
+                self.ctx.store_unchecked().await.err().map(|e| format!("{e:#}"))
+            })
             .await;
         // `try_store` never opens: by here, the probe above already decided.
         self.ctx.try_store()

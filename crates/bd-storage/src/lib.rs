@@ -42,6 +42,43 @@ pub use error::{Error, Result};
 pub use locator::{Backend, Locator};
 pub use stats::Stats;
 
+/// The version of the workspace schema this build speaks.
+///
+/// One number for every backend, on purpose. The schema is the *domain's*
+/// shape — issues, edges, labels, events — and it evolves in lockstep across
+/// backends; a per-backend version would just be this number written twice,
+/// with a new way for the copies to disagree.
+///
+/// Why this exists at all: upstream ships schema changes release after release
+/// with no recorded version, so every upgrade is a coordinated, manual event —
+/// pick a master, `bd migrate`, every other machine re-bootstraps, and
+/// version skew between machines corrupts sync (this is a documented,
+/// recurring source of user pain upstream). The stamp is cheap insurance
+/// bought *before* the first schema change exists: every database carries the
+/// version it was written at, so a mismatch is a precise, explained refusal
+/// instead of a raw SQL error three queries in.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The version a raw stamp *means*.
+///
+/// `0` is a database written before this port recorded versions at all —
+/// exactly one schema shape ever shipped unversioned, so "unstamped" and "v1"
+/// are the same thing by construction, and existing workspaces keep working
+/// with no ceremony. This rule lives in one place; callers that see a raw
+/// stamp (the version gate, `bd doctor`, `migrate`) all go through it.
+pub fn effective_schema_version(raw: u32) -> u32 {
+    if raw == 0 { 1 } else { raw }
+}
+
+/// What [`Storage::migrate`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateOutcome {
+    /// The raw stamp before — `0` if the database predated version stamping.
+    pub from: u32,
+    /// The stamp now: always [`SCHEMA_VERSION`] on success.
+    pub to: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +486,27 @@ pub trait Storage: Send + Sync {
     // --- aggregate ---
 
     async fn stats(&self) -> Result<Stats>;
+
+    // --- schema version ---
+
+    /// The schema version stamped in the store, **raw**: `0` means the
+    /// database predates version stamping (see [`effective_schema_version`],
+    /// which is the only place that interprets it).
+    ///
+    /// Deliberately not defaulted. A backend that forgot to implement this
+    /// would otherwise report "current" forever and the version gate would
+    /// wave through every mismatch — a check that fails open is the exact
+    /// upstream bug (a gate query timing out and being treated as passed) this
+    /// port is built not to repeat.
+    async fn schema_version(&self) -> Result<u32>;
+
+    /// Bring the store's schema to [`SCHEMA_VERSION`], stamping it on the way.
+    ///
+    /// Today the only work is the stamp itself (`from: 0` → `to: 1`); when a
+    /// v2 schema ever ships, the per-backend migration ladder runs here.
+    /// Refuses a database stamped *newer* than this build — a migration
+    /// downward is data loss wearing a maintenance command's name.
+    async fn migrate(&self) -> Result<MigrateOutcome>;
 
     // --- lifecycle ---
 

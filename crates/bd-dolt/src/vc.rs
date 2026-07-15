@@ -507,10 +507,10 @@ impl RemoteStore for DoltStore {
 
     async fn push(&self, remote: &str, branch: &str) -> Result<()> {
         let mut c = self.vc_conn().await?;
-        call(
+        bounded(call(
             &mut c,
             sqlx::query("CALL DOLT_PUSH(?, ?)").bind(remote).bind(branch),
-        )
+        ))
         .await
         .map_err(|e| remote_error("push", remote, e))?;
         Ok(())
@@ -520,10 +520,10 @@ impl RemoteStore for DoltStore {
         let mut c = self.vc_conn().await?;
         let before = head_hash(&mut c).await?;
 
-        let rows = call(
+        let rows = bounded(call(
             &mut c,
             sqlx::query("CALL DOLT_PULL(?, ?)").bind(remote).bind(branch),
-        )
+        ))
         .await
         .map_err(|e| remote_error("pull", remote, e))?;
 
@@ -546,7 +546,7 @@ impl RemoteStore for DoltStore {
         // so, alone among the remote operations, it does not disturb the
         // readiness cache and does not recompute it.
         let mut c = self.vc_conn().await?;
-        call(&mut c, sqlx::query("CALL DOLT_FETCH(?)").bind(remote))
+        bounded(call(&mut c, sqlx::query("CALL DOLT_FETCH(?)").bind(remote)))
             .await
             .map_err(|e| remote_error("fetch", remote, e))?;
         Ok(())
@@ -804,6 +804,64 @@ fn is_nothing_to_commit(msg: &str) -> bool {
     m.contains("nothing to commit")
         || m.contains("no changes added to commit")
         || m.contains("cannot commit an empty commit")
+}
+
+/// How long a remote operation (push, pull, fetch) may run before bd stops
+/// waiting: `BEADS_REMOTE_TIMEOUT` seconds, `0` to disable, ten minutes when
+/// unset.
+///
+/// This exists because of a documented failure mode upstream: users report
+/// `dolt fetch` calls that run for *hours*, during which the client sits in
+/// total silence — no progress, no deadline, no way to tell "huge remote" from
+/// "wedged server". A bounded wait with an honest error beats both. The limit
+/// is generous by default precisely because slow-but-working fetches are real;
+/// anyone with a genuinely enormous remote raises it, knowingly, by name.
+///
+/// A malformed value is an error, not a shrug — silently substituting the
+/// default is how you spend an afternoon wondering why your limit is still ten
+/// minutes.
+const DEFAULT_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn remote_timeout() -> Result<Option<std::time::Duration>> {
+    parse_remote_timeout(std::env::var("BEADS_REMOTE_TIMEOUT").ok().as_deref())
+}
+
+fn parse_remote_timeout(raw: Option<&str>) -> Result<Option<std::time::Duration>> {
+    match raw {
+        None => Ok(Some(DEFAULT_REMOTE_TIMEOUT)),
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(std::time::Duration::from_secs(n))),
+            Err(_) => Err(Error::Db(format!(
+                "BEADS_REMOTE_TIMEOUT is set to {s:?}, which is not a number of seconds \
+                 (use 0 to disable the limit)"
+            ))),
+        },
+    }
+}
+
+/// Run a remote operation under the deadline.
+///
+/// On timeout the error is raw material for [`remote_error`], which prefixes
+/// the operation and remote. Two honest caveats live in the message: dropping
+/// the client future does **not** cancel the work inside `dolt sql-server`
+/// (it may finish on its own), and the store's one pooled connection is
+/// abandoned mid-query — fine for the CLI, which exits on the error it is
+/// about to receive.
+async fn bounded<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match remote_timeout()? {
+        None => fut.await,
+        Some(limit) => match tokio::time::timeout(limit, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(Error::Db(format!(
+                "no response after {}s; gave up waiting. Dolt may still be working — a large \
+                 history makes fetches genuinely slow — but unbounded silence helps nobody. \
+                 Raise the limit with BEADS_REMOTE_TIMEOUT=<seconds> (0 disables it) if this \
+                 remote is really that big",
+                limit.as_secs()
+            ))),
+        },
+    }
 }
 
 /// Credentials are Dolt's business, not ours.
@@ -1597,5 +1655,31 @@ mod tests {
         // The join drags in dolt_log's `committer`/`date`; an unqualified star
         // would make which side wins depend on join order.
         assert!(!qualified.contains(" committer"));
+    }
+
+    // --- the remote deadline ---
+
+    #[test]
+    fn remote_timeout_defaults_disables_on_zero_and_refuses_garbage() {
+        use super::{DEFAULT_REMOTE_TIMEOUT, parse_remote_timeout};
+        use std::time::Duration;
+
+        assert_eq!(parse_remote_timeout(None).unwrap(), Some(DEFAULT_REMOTE_TIMEOUT));
+        assert_eq!(
+            parse_remote_timeout(Some("90")).unwrap(),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_remote_timeout(Some(" 3600 ")).unwrap(),
+            Some(Duration::from_secs(3600)),
+            "surrounding whitespace is not a configuration error"
+        );
+        assert_eq!(parse_remote_timeout(Some("0")).unwrap(), None, "0 disables");
+
+        // A typo silently becoming the default is how a raised limit does not
+        // take effect and nobody finds out until the next multi-hour fetch.
+        let err = parse_remote_timeout(Some("10m")).unwrap_err().to_string();
+        assert!(err.contains("BEADS_REMOTE_TIMEOUT"), "names the setting: {err}");
+        assert!(err.contains("10m"), "quotes the bad value: {err}");
     }
 }
