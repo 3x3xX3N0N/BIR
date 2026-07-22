@@ -3,10 +3,12 @@
 The command surface is **complete**: every command upstream has is registered,
 with its flags, aliases and help. What varies is what happens when you run one.
 
-**734 tests. Two backends, both complete and green: SQLite, and Dolt —
-**verified against real dolt 2.1.10** (100 bd-dolt tests run for real; nothing
-skips). Dolt's binary is a runtime dependency, not vendored; install it and it is
-on. See "Dolt: verified" at the bottom.**
+**746 tests. Two backends: SQLite, complete and green everywhere; Dolt,
+complete — and verified wherever a `dolt` binary is present, but on a host
+WITHOUT one its 31 integration tests skip LOUDLY (they cover nothing and say
+so). Dolt's binary is a runtime dependency, not vendored; install it and those
+31 run. See "Dolt: what is untested, and why" at the bottom for exactly which,
+and why the skip is loud rather than silent.**
 
 ## How to resume
 
@@ -55,16 +57,20 @@ something an install fixes.
 
 **Views** — `list`, `ready`, `blocked`, `search`, `query`, `count`, `status`,
 `history`, `where`, `children`, `epic status|close-eligible`, `info`, `stale`,
-`orphans`, `duplicates`, `find-duplicates`, `lint`, `kv`, `audit`, `context`,
-`ping`, **`diff`** (needs a commit graph → exit 2 on SQLite).
+`orphans`, `duplicates`, `find-duplicates`, `lint`, `context`,
+`ping`, **`diff`** (needs a commit graph → exit 2 on SQLite). (`kv` and `audit`
+are NOT here — they are stubs; see the exit-64 table.)
 
 **Deps** — `dep add|remove|list|tree|cycles|relate|unrelate`, `graph`,
 `graph check`, `recompute-blocked`.
 
-**Sync** — `export`, `import`, `ship`, `mail`, `repo`, **`branch`** (exit 2 on
-SQLite), `vc`, `dolt *`, and six trackers (`github`, `gitlab`, `jira`, `linear`,
+**Sync** — `export`, `import`, `ship`, `mail`, **`branch`** (exit 2 on
+SQLite), and six trackers (`github`, `gitlab`, `jira`, `linear`,
 `notion`, `ado`) each with `sync|status|push|pull`. Every tracker is tested
 offline against a fake HTTP seam — **zero network calls, zero credentials.**
+(`vc`, `dolt *`, `federation *` and `repo` are NOT here — they are stubs; see
+the exit-64 table. `branch` is the only version-control command with a real
+implementation.)
 
 **Setup** — `init` (`--backend=sqlite|dolt`), `version`, `completion`,
 `config set|get|list`, `bootstrap`, `setup`, `onboard`, `quickstart`, `prime`,
@@ -76,8 +82,9 @@ list|show|schema`. The compiler is the `bd-formula` crate — pure, TOML in, a p
 of proto-issues out, tested against the formula files upstream ships.
 
 **Maintenance** — **`doctor`** (48 checks, 9 families, `--fix`), `preflight`,
-`gc`, `purge`, `prune`, `reclaim`, `admin cleanup`, `backup` (exit 2 on SQLite —
-it is a *Dolt* backup: branches, history, working set), `merge-slot`, `worktree`.
+`gc`, `purge`, `prune`, `reclaim`, `admin cleanup`, **`migrate`** (stamps the
+schema version; refuses a downgrade). (`backup`, `merge-slot` and `worktree`
+are NOT here — they are stubs; see the exit-64 table.)
 
 **Advanced** — **`mol`** (`wisp`, `seed --var`, `pour`, `show`, `ready`,
 `current`, `stale`, `burn`, `squash`, `bond`), **`gate`** (`create`, `show`,
@@ -99,6 +106,15 @@ seed`/`pour` cook a formula into a tracked container.
 | `config unset` / `validate` / `show` | The seam has no config *delete*. |
 | `sql` | Raw SQL cannot go through a backend-agnostic trait, and giving it one would make every other backend a liar the moment it did not speak SQLite's dialect. **The seam has no `execute_sql`, on purpose.** |
 | `formula convert` | This port only ever spoke TOML; there is nothing to convert *from*. |
+| `vc merge` / `vc commit` / `vc status` | Needs a write path through `VersionControl`. Exit 2 on SQLite (no commit graph), exit 64 on Dolt. |
+| `dolt *` (11 subcommands + `dolt remote add`/`list`/`remove`) | The `dolt sql-server`/branch/remote plumbing lives in `bd-dolt`; the CLI dispatch is not wired. Exit 2 on SQLite, exit 64 on Dolt. |
+| `federation sync` / `status` / `add-peer` / `remove-peer` / `list-peers` | Peer registry has no home in `Config`. Exit 2 on SQLite, exit 64 on Dolt. |
+| `repo add` / `remove` / `list` / `sync` | No `repos:` field in `Config`, and the seam hands out exactly one store. Exit 64 unconditionally (no cap gate). |
+| `kv set` / `get` / `clear` / `list` | The seam has no key/value store; `get_config`/`set_config` are the config table, not a KV. |
+| `audit record` / `label` | Nothing on the seam writes an `Event`, and `EventType` has no free-text variant. |
+| `backup status` / `init` / `sync` / `remove` / `restore` | Exit 2 on SQLite (no commit graph — it is a *Dolt* backup: branches, history, working set). On a Dolt workspace the work is real and simply not wired, so exit 64. |
+| `merge-slot create` / `check` / `acquire` / `release` | Needs an atomic read-modify-write on metadata (`Storage::swap_metadata`), which the seam does not expose. |
+| `worktree create` / `list` / `remove` / `info` | A *git* worktree subsystem; this port has no git module. |
 
 ---
 
@@ -207,14 +223,19 @@ Things a future maintainer would otherwise rediscover the hard way.
 
 ## Dolt: what is untested, and why
 
-The Dolt backend is **complete and unverified**. There is no `dolt` binary on the
-development machine and installing one was not authorized. Every test that needs a
-real server **skips loudly** — `"SKIPPED: this test is NOT covering anything"` —
-because a test that silently passes by doing nothing is worse than no test: it
-reports as coverage.
+The Dolt backend is **complete, and verified wherever a `dolt` binary is
+present** — install `dolt` and its integration tests run for real. On a host
+WITHOUT one, every test that needs a real server **skips loudly** —
+`"SKIPPED: this test is NOT covering anything"` — because a test that silently
+passes by doing nothing is worse than no test: it reports as coverage.
 
-To verify, install `dolt` and run `cargo test --workspace`. The 29 skipping tests
-will light up. In rough order of danger:
+**There are exactly 31 such tests** (`require_dolt!` in `bd-dolt/src/lib.rs`: 5
+in `tests/server.rs`, 5 in `tests/vc.rs`, and 21 via the `fixture!` macro in
+`tests/store.rs` — every integration test in `bd-dolt/tests/`). Symmetrically,
+one test in `bd-cli/tests/doctor_dolt.rs` skips only when dolt IS present (it
+asserts the *absent*-binary refusal). So "nothing skips" is never quite true:
+without dolt, 31 skip; with dolt, that one does. Install `dolt` and run
+`cargo test --workspace`; the 31 light up, in rough order of danger:
 
 1. **The merge test.** Two clones diverge, both mutate the graph, merge — and
    `bd ready` must still be correct. Note that the *obvious* version of this test
