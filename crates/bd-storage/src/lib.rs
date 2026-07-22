@@ -83,6 +83,31 @@ pub struct MigrateOutcome {
 mod tests {
     use super::*;
 
+    /// The invariant a future migration ladder leans on (bead warden-8pd): a raw
+    /// stamp of 0 (pre-versioning) is INDISTINGUISHABLE from a raw 1 once run
+    /// through `effective_schema_version`. So a ladder keyed on `effective`
+    /// treats a 0.1.0 workspace as v1 and runs the v1→v2 step; a ladder keyed on
+    /// the raw stamp would see 0, miss the step, and stamp v2 onto v1 data. This
+    /// test fails loudly if anyone ever makes 0 mean something other than v1.
+    #[test]
+    fn a_preversioning_stamp_is_v1_indistinguishable() {
+        assert_eq!(effective_schema_version(0), 1, "0 is pre-versioning == v1");
+        assert_eq!(
+            effective_schema_version(0),
+            effective_schema_version(1),
+            "raw 0 and raw 1 must be indistinguishable to the migration ladder"
+        );
+        assert_eq!(
+            effective_schema_version(0),
+            SCHEMA_VERSION,
+            "a pre-versioning database is at the shipped schema, so `migrate` on \
+             it must be a no-op stamp, not a schema step"
+        );
+        // A real future stamp is passed through unchanged.
+        assert_eq!(effective_schema_version(2), 2);
+        assert_eq!(effective_schema_version(7), 7);
+    }
+
     #[test]
     fn a_patch_can_say_leave_it_set_it_and_empty_it() {
         // The distinction Option<T> could not make, and the reason `bd undefer`

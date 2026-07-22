@@ -1471,9 +1471,18 @@ impl Storage for DoltStore {
             )));
         }
 
-        // The migration ladder runs here when a v2 schema ever ships. Today
-        // the only possible work is stamping a pre-versioning database.
-        if from != bd_storage::SCHEMA_VERSION {
+        // The migration ladder runs here when a v2 schema ever ships.
+        //
+        // WHEN YOU WRITE THAT LADDER, KEY IT ON `effective`, NEVER ON THE RAW
+        // `from` (bead warden-8pd). A pre-versioning database reads `from == 0`
+        // but IS schema v1, so `match from { 1 => v1_to_v2(), .. }` would SKIP
+        // the step for a pre-versioning clone and stamp v2 onto v1-shaped data.
+        // `match effective { 1 => .. }` is correct (effective is never 0). The
+        // `raw_needs_stamp` check below is the ONE place raw `from` is
+        // legitimate: it detects an UNSTAMPED database so the stamp lands even
+        // when no schema step ran. See the twin comment in bd-sqlite.
+        let raw_needs_stamp = from != bd_storage::SCHEMA_VERSION;
+        if raw_needs_stamp {
             sqlx::query(
                 "INSERT INTO schema_meta (id, version) VALUES (1, ?)
                  ON DUPLICATE KEY UPDATE version = ?",

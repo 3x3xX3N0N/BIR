@@ -1276,10 +1276,20 @@ impl Storage for SqliteStore {
         }
 
         // The migration ladder runs here when a v2 schema ever ships: one step
-        // per version, each inside a transaction, stamping as it lands. Today
-        // effective == SCHEMA_VERSION == 1 always, so the only possible work
-        // is stamping a pre-versioning database.
-        if from != bd_storage::SCHEMA_VERSION {
+        // per version, each inside a transaction, stamping as it lands.
+        //
+        // WHEN YOU WRITE THAT LADDER, KEY IT ON `effective`, NEVER ON THE RAW
+        // `from` (bead warden-8pd). A pre-versioning database has `from == 0` but
+        // IS schema v1 (that is what `effective_schema_version` encodes), so the
+        // natural `match from { 1 => v1_to_v2(), .. }` would SKIP the v1→v2 step
+        // for every 0.1.0 workspace in the wild and then stamp v2 onto v1-shaped
+        // data — silent corruption the open-time gate would wave through forever.
+        // `match effective { 1 => v1_to_v2(), .. }` is correct because effective
+        // is never 0. The `raw_needs_stamp` check below is the ONE place raw
+        // `from` is legitimate: it detects an UNSTAMPED file (from == 0) so the
+        // stamp is written even when no schema step ran. Keep the two separate.
+        let raw_needs_stamp = from != bd_storage::SCHEMA_VERSION;
+        if raw_needs_stamp {
             sqlx::raw_sql(&format!(
                 "PRAGMA user_version = {}",
                 bd_storage::SCHEMA_VERSION
