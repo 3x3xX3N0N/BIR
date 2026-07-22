@@ -115,6 +115,33 @@ impl Drop for Repo {
     }
 }
 
+/// A canonicalized temp directory that removes itself on drop — for the tests
+/// that need a NON-git workspace (so they cannot use [`Repo`], which runs
+/// `git init`). Its name carries the thread id as well as the pid so two tests
+/// in the same binary never collide on a shared pid, and the `Drop` guard means
+/// a PANICKING test cleans up too, instead of leaking its workspace into
+/// `%TEMP%` (bead warden-2ol — the suite had left ~12k `bd-*` dirs behind).
+struct TempWs(PathBuf);
+
+impl TempWs {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "bd-doctor-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&p).ok();
+        std::fs::create_dir_all(&p).unwrap();
+        TempWs(std::fs::canonicalize(&p).unwrap())
+    }
+}
+
+impl Drop for TempWs {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 fn path_with_bd() -> std::ffi::OsString {
     let bin = Path::new(env!("CARGO_BIN_EXE_bd")).parent().unwrap().to_path_buf();
     let mut dirs = vec![bin];
@@ -252,10 +279,8 @@ fn an_ignore_rule_in_the_project_gitignore_counts() {
 /// be yellow just because there is no repository.
 #[test]
 fn outside_a_git_repository_the_family_is_silent() {
-    let p = std::env::temp_dir().join(format!("bd-doctor-nogit-{}", std::process::id()));
-    std::fs::remove_dir_all(&p).ok();
-    std::fs::create_dir_all(&p).unwrap();
-    let dir = std::fs::canonicalize(&p).unwrap();
+    let ws = TempWs::new("nogit");
+    let dir = &ws.0;
 
     let bd = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_bd"))
@@ -288,8 +313,7 @@ fn outside_a_git_repository_the_family_is_silent() {
         noisy.is_empty(),
         "not using git is not a fault, but these fired anyway: {noisy:?}"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
+    // `ws` removes itself on drop (including if an assert above panicked).
 }
 
 /// Conflict markers are the one thing in this family that is genuinely *broken*:
@@ -476,10 +500,8 @@ fn an_unmerged_beads_file_is_an_error() {
 /// whose precondition was missing still gets its repair invoked. It must decline.
 #[test]
 fn fix_outside_a_repository_repairs_nothing() {
-    let p = std::env::temp_dir().join(format!("bd-doctor-nofix-{}", std::process::id()));
-    std::fs::remove_dir_all(&p).ok();
-    std::fs::create_dir_all(&p).unwrap();
-    let dir = std::fs::canonicalize(&p).unwrap();
+    let ws = TempWs::new("nofix");
+    let dir = &ws.0;
 
     let bd = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_bd"))
@@ -504,6 +526,5 @@ fn fix_outside_a_repository_repairs_nothing() {
         assert_ne!(r["outcome"], "fixed", "repaired something outside a repo: {r:#}");
     }
     assert!(!dir.join(".beads/.gitignore").exists(), "--fix wrote a .gitignore with no git");
-
-    std::fs::remove_dir_all(&dir).ok();
+    // `ws` removes itself on drop, even if an assert above panicked.
 }

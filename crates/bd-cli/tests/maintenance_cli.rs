@@ -82,6 +82,30 @@ impl Drop for Ws {
     }
 }
 
+/// A self-removing temp directory for the one test that stands OUTSIDE a
+/// workspace (so it cannot use [`Ws`]). The `Drop` guard cleans up on panic too,
+/// rather than leaking into `%TEMP%` (bead warden-2ol).
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "bd-maint-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&p).ok();
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(std::fs::canonicalize(&p).unwrap())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 fn wisp(id: &str, kind: &str, age_hours: i64) -> Value {
     let born = chrono::Utc::now() - chrono::Duration::hours(age_hours);
     serde_json::json!({
@@ -322,9 +346,8 @@ fn purge_leaves_open_work_and_young_closed_work_alone() {
 
 #[test]
 fn preflight_without_a_workspace_reports_instead_of_crashing() {
-    let tmp = std::env::temp_dir().join(format!("bd-maint-pf-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let tmp = std::fs::canonicalize(&tmp).unwrap();
+    let guard = TempDir::new("pf");
+    let tmp = &guard.0;
 
     let out = bd()
         .args(["-C", tmp.to_str().unwrap(), "--json", "preflight"])
@@ -344,8 +367,7 @@ fn preflight_without_a_workspace_reports_instead_of_crashing() {
         .find(|c| c["check"] == "workspace")
         .expect("a workspace check");
     assert_eq!(ws["status"], "fail");
-
-    std::fs::remove_dir_all(&tmp).ok();
+    // `guard` removes itself on drop, even if an assert above panicked.
 }
 
 #[test]

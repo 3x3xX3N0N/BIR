@@ -106,6 +106,30 @@ impl Drop for Ws {
     }
 }
 
+/// A self-removing temp directory for the tests that stand OUTSIDE a workspace
+/// (so they cannot use [`Ws`]). The `Drop` guard cleans up even on panic,
+/// instead of leaking into `%TEMP%` (bead warden-2ol).
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "bd-doctorid-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&p).ok();
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(std::fs::canonicalize(&p).unwrap())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 fn status(f: &Value) -> &str {
     f["status"].as_str().unwrap_or("<missing>")
 }
@@ -436,9 +460,8 @@ fn foreign_ids_are_a_warning_not_a_failure() {
 /// errors nor a wall of yellow: there is no identity here to have drifted.
 #[test]
 fn outside_a_workspace_the_family_is_quiet() {
-    let dir = std::env::temp_dir().join(format!("bd-doctorid-none-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
+    let ws = TempDir::new("none");
+    let dir = &ws.0;
     assert!(!dir.join(".beads").exists());
 
     let out = bd()
@@ -461,8 +484,7 @@ fn outside_a_workspace_the_family_is_quiet() {
             evidence(f)
         );
     }
-
-    std::fs::remove_dir_all(&dir).ok();
+    // `ws` removes itself on drop, even if an assert above panicked.
 }
 
 /// `run()` must never mutate. The rule is stated in the seam docs; here it is
