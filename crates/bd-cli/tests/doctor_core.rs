@@ -399,6 +399,115 @@ impl Ws {
     }
 }
 
+/// Fix A (bead `warden-7ff`): a clean `bd` exit checkpoints the WAL back into the
+/// main file, so no `-wal`/`-shm` sidecar is left on disk. Without this, a killed
+/// checkpoint thread leaves the main file short of its own header — which the
+/// integrity check then read as a truncated database (~7-17% of runs) and told
+/// the user to restore from backup.
+#[test]
+fn a_clean_exit_leaves_no_wal_sidecar() {
+    let ws = Ws::new("clean-exit-wal");
+    for i in 0..8 {
+        assert_eq!(ws.run(&["create", &format!("issue {i}")]).1, 0);
+    }
+    // The last `create` is a clean exit; nothing else runs after it.
+    let wal = ws.beads().join("beads.db-wal");
+    let shm = ws.beads().join("beads.db-shm");
+    assert!(
+        !wal.exists(),
+        "a clean exit must checkpoint the WAL away, found {}",
+        wal.display()
+    );
+    assert!(!shm.exists(), "the -shm sidecar must be gone too");
+}
+
+/// A whole-number-of-pages main file that is SHORTER than its own header claims,
+/// WITH a live `-wal` beside it, is the killed-mid-checkpoint state — recoverable,
+/// not truncated. The WAL is authoritative and the read-back below (through
+/// sqlite, which applies the WAL) is the real determination, so integrity must NOT
+/// cry truncation. This is the exact false positive `warden-7ff` fixed: before it,
+/// this fixture failed doctor with "shorter than its header says" and a
+/// restore-from-backup fix.
+#[test]
+fn a_short_header_with_a_live_wal_is_recoverable_not_truncated() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    let ws = Ws::new("wal-torn");
+    for i in 0..20 {
+        assert_eq!(ws.run(&["create", &format!("issue {i}")]).1, 0);
+    }
+    // After the clean creates there is no WAL (Fix A). Now produce a GENUINE one:
+    // a WAL-mode write with autocheckpoint off, whose pool close does NOT
+    // checkpoint (only bd-sqlite's `Storage::close` does). The WAL ends up holding
+    // the new pages AND an updated page-1 frame claiming the larger page count.
+    let db = ws.db();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    rt.block_on(async {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .pragma("wal_autocheckpoint", "0"),
+            )
+            .await
+            .expect("open behind the store's back");
+        sqlx::query("CREATE TABLE pad(id INTEGER PRIMARY KEY, x BLOB)")
+            .execute(&pool)
+            .await
+            .expect("create pad");
+        for _ in 0..80 {
+            sqlx::query("INSERT INTO pad(x) VALUES(randomblob(3500))")
+                .execute(&pool)
+                .await
+                .expect("insert pad");
+        }
+        // Do NOT close the pool: sqlite checkpoints the WAL when the LAST
+        // connection closes (the same auto-checkpoint bd's own `Storage::close`
+        // relies on), so a clean close would erase the very state under test.
+        // Leaking the one connection keeps the database open, so the WAL stays on
+        // disk. The fd is released when this test binary exits.
+        std::mem::forget(pool);
+    });
+    assert!(
+        ws.beads().join("beads.db-wal").exists(),
+        "the fixture needs a live WAL"
+    );
+
+    // Rewrite the MAIN FILE's page-1 header to claim more pages than the file
+    // physically holds — the state a checkpoint killed after the header write and
+    // before extending the file leaves. sqlite reads page 1 from the WAL (newer),
+    // so it still opens and reads; only `inspect`, which reads the raw main file,
+    // sees the short header.
+    let mut bytes = std::fs::read(&db).unwrap();
+    let page_size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+        1 => 65536u64,
+        n => u64::from(n),
+    };
+    let file_pages = bytes.len() as u64 / page_size;
+    let claim = (file_pages + 8) as u32;
+    bytes[28..32].copy_from_slice(&claim.to_be_bytes());
+    // change counter == version-valid-for, so the page count is trusted.
+    let cc = [bytes[24], bytes[25], bytes[26], bytes[27]];
+    bytes[92..96].copy_from_slice(&cc);
+    std::fs::write(&db, &bytes).unwrap();
+
+    // The store opens and reads via the WAL, and integrity does not cry
+    // truncation.
+    let (r, code) = ws.doctor(&[]);
+    assert_eq!(
+        r.status("integrity"),
+        "ok",
+        "a short main file with a live WAL is recoverable, not truncated: {}",
+        r.text("integrity")
+    );
+    assert_eq!(code, 0, "doctor must not fail a recoverable database: {}", r.0);
+}
+
 // ---------------------------------------------------------------------------
 // The fresh clone — and the fix, actually run
 // ---------------------------------------------------------------------------

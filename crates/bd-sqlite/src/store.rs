@@ -1296,6 +1296,24 @@ impl Storage for SqliteStore {
     }
 
     async fn close(&self) -> Result<()> {
+        // Checkpoint the WAL back into the main file BEFORE dropping the pool,
+        // and while this async task can still await it.
+        //
+        // sqlx runs each connection's teardown on a DETACHED thread: `pool.close()`
+        // returns before that thread has run `sqlite3_close` and its implicit
+        // checkpoint, and the CLI's `main` then calls `std::process::exit`, which
+        // kills the thread mid-copy. The main file is left a whole number of pages
+        // SHORT of the page count its own header already advertises, with a `-wal`
+        // sidecar still on disk — and `bd doctor`'s integrity check reads that as a
+        // truncated database and tells the user to restore from backup. A TRUNCATE
+        // checkpoint here makes the graceful exit deterministic: the frames land in
+        // the main file and the sidecars are removed. Best-effort — a checkpoint
+        // failure is not worth failing a close over, and the integrity check no
+        // longer cries truncation while a `-wal` sidecar remains, so the crash /
+        // SIGKILL path (which this cannot cover) stays safe too.
+        let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&self.pool)
+            .await;
         self.pool.close().await;
         Ok(())
     }

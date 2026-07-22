@@ -185,6 +185,17 @@ fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes(a)
 }
 
+/// Whether SQLite's write-ahead-log sidecar exists beside `path`.
+///
+/// The WAL for `foo.db` is `foo.db-wal` (a suffix on the whole filename, not a
+/// replaced extension), so `with_extension` would be wrong. Its presence means
+/// the main file may legitimately be behind its own header page count.
+fn wal_exists(path: &Path) -> bool {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    Path::new(&wal).exists()
+}
+
 fn inspect(path: &Path) -> Shape {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -193,10 +204,6 @@ fn inspect(path: &Path) -> Shape {
     };
     if !meta.is_file() {
         return Shape::NotAFile;
-    }
-    let len = meta.len();
-    if len == 0 {
-        return Shape::Empty;
     }
 
     let mut file = match std::fs::File::open(path) {
@@ -219,6 +226,20 @@ fn inspect(path: &Path) -> Shape {
         }
     }
     let head = &buf[..got];
+
+    // Sample the length from the SAME handle, AFTER the header. A concurrent
+    // checkpoint can only EXTEND the main file — sqlite writes the WAL frames
+    // back (growing it) before truncating the WAL — so reading len after the
+    // header means a race can only CLEAR a false "shorter than its header"
+    // verdict, never manufacture one. Taking len from a separate earlier
+    // `metadata()` call is exactly the TOCTOU that produced the false alarm.
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => return Shape::Unreadable(e.to_string()),
+    };
+    if len == 0 {
+        return Shape::Empty;
+    }
 
     if got < 100 || &head[..16] != SQLITE_MAGIC {
         return Shape::Foreign(preview(head));
@@ -686,7 +707,21 @@ impl Check for Integrity {
             }
             if let Some(pages) = h.pages
                 && pages.saturating_mul(h.page_size) > len
+                && !wal_exists(&path)
             {
+                // Only truncation when there is NO `-wal` sidecar to explain the
+                // shortfall. In WAL mode the main file is legitimately behind its
+                // own header — new pages live in the WAL until a checkpoint writes
+                // them back — and `bd` can be killed (or the machine can crash)
+                // mid-checkpoint leaving exactly a short main file plus a `-wal`.
+                // The WAL is authoritative, so that is a recoverable state, not
+                // corruption: the read-back probes below go THROUGH sqlite, which
+                // applies the WAL, and are the real determination. Reporting
+                // truncation here would tell a user with a perfectly good database
+                // to restore from backup. (SQLite extends the main file to full
+                // size and only THEN truncates the WAL, so "no `-wal`" genuinely
+                // means the main file is whole — the check does not lose its teeth
+                // for the real truncation it exists to catch.)
                 return truncated(
                     "the database file is shorter than its header says".to_string(),
                     format!(
